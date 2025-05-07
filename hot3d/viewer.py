@@ -138,6 +138,7 @@ def execute_rerun(
     # Visualize the dataset sequence
     #
     # Loop over the timestamps of the sequence and visualize corresponding data
+    
     for timestamp in tqdm(timestamps[timestamps_slice]):
         rr.set_time_nanos("synchronization_time", int(timestamp))
         rr.set_time_sequence("timestamp", timestamp)
