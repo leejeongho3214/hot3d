@@ -150,7 +150,7 @@ class Hot3DVisualizer:
         self.obj = {'r_contact_bbox': defaultdict(lambda: None), 'vertex': defaultdict(), 'l_contact_bbox': defaultdict(lambda: None)}
         self.seq = []
         self.check_no_gaze = []
-        self.hand = {'right': defaultdict(), 'left': defaultdict(), 'r_vertex': defaultdict(), 'l_vertex': defaultdict()}
+        self.hand = {'right': defaultdict(lambda: None), 'left': defaultdict(lambda: None), 'r_vertex': defaultdict(), 'l_vertex': defaultdict()}
         ############################################################
         
         self._hot3d_data_provider = hot3d_data_provider
@@ -431,6 +431,7 @@ class Hot3DVisualizer:
                     sizes=[bbox.width, bbox.height],
                 ))
         
+        ## Save both hand's mesh vertex
         for hand_pose_data in hand_pose_collection.poses.values():
             if hand_pose_data.is_left_hand():
                 logged_left_hand_data = True
@@ -512,6 +513,7 @@ class Hot3DVisualizer:
             box2d_collection_with_dt.box2d_collection.object_uid_list
         )
         
+        ## Load object vertices once for the target sequence
         global signal
         if signal:
             signal = False
@@ -524,6 +526,7 @@ class Hot3DVisualizer:
                 vertices_local = mesh.vertices  
                 self.obj['vertex'][object_uid] = vertices_local
             self.obj['vertex'] = dict(self.obj['vertex'])
+        
         
         for object_uid in object_uids_at_query_timestamp:
             ## Retrieve the bounding boxes of the objects in order
@@ -568,54 +571,61 @@ class Hot3DVisualizer:
                     labels=str(round(visibility_ratio, 2))
                 ),
             )
-        
-        # sorted_uids = sorted(
-        #     c_box.keys(),
-        #     key=lambda uid: c_box[uid].visibility_ratio,
-        #     reverse=True  # 큰 값이 먼저 오도록 내림차순 정렬
-        # )
-        # f_uid = max(sorted_uids, key=lambda uid: -distance(get_bbox_center(c_box[uid].box2d), self.gaze_list[self.time][1]) if (c_box[uid].box2d is not None and c_box[uid].visibility_ratio > 0.8) else float(-np.inf))
-    
-    
-        r_hand = [self.hand['right'][self.time].left, self.hand['right'][self.time].left + self.hand['right'][self.time].width,
-                self.hand['right'][self.time].top, self.hand['right'][self.time].top + self.hand['right'][self.time].height]
             
-        l_hand = [self.hand['left'][self.time].left, self.hand['left'][self.time].left + self.hand['left'][self.time].width,
-                self.hand['left'][self.time].top, self.hand['left'][self.time].top + self.hand['left'][self.time].height]
+        ## Define bounding box positions for each hand
+        if self.hand['right'][self.time] is not None:
+            r_hand = [self.hand['right'][self.time].left, self.hand['right'][self.time].left + self.hand['right'][self.time].width,
+                    self.hand['right'][self.time].top, self.hand['right'][self.time].top + self.hand['right'][self.time].height]
+            right_ = True
+        else:
+            right_ = False
+            
+        if self.hand['left'][self.time] is not None:
+            l_hand = [self.hand['left'][self.time].left, self.hand['left'][self.time].left + self.hand['left'][self.time].width,
+                    self.hand['left'][self.time].top, self.hand['left'][self.time].top + self.hand['left'][self.time].height]
+            left_ = True
+        else:
+            left_ = False
 
         
         c_box = box2d_collection_with_dt.box2d_collection.box2ds
         for k, v in c_box.items():
             if v.box2d == None:
                 continue
-        
             obj = [v.box2d.left, v.box2d.left + v.box2d.width,
                 v.box2d.top, v.box2d.top + v.box2d.height]
-            r_o = is_overlap(r_hand, obj)
-            l_o = is_overlap(l_hand, obj)
+            
+            overlap_left = left_ and is_overlap(l_hand, obj)
+            overlap_right = right_ and is_overlap(r_hand, obj)
 
-            if r_o or l_o:
+            if overlap_left or overlap_right:
+                # 물체를 월드 좌표로 변환
                 T = object_poses_with_dt.pose3d_collection.poses[k].T_world_object.to_matrix()
                 vertices_local = self.obj['vertex'][k]
-                # 물체 메쉬 좌표 (N, 3)를 homogeneous 좌표 (N, 4)로 확장
                 vertices_homo = np.hstack([vertices_local, np.ones((vertices_local.shape[0], 1))])
                 vertices_world = (T @ vertices_homo.T).T[:, :3]
                 tree = cKDTree(vertices_world)
-                
-                if r_o:
-                    distances, _ = tree.query(self.hand['r_vertex'][self.time])
-                    if distances.min() < 0.05:
-                        if self.obj['r_contact_bbox'][self.time] is not None:
-                            if self.obj['r_contact_bbox'][self.time][-1] > distances.min(): [object_library.object_id_to_name_dict[k], c_box[k].box2d, distances.min()]
-                        else:
-                            self.obj['r_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, distances.min()]
-                if l_o:
-                    distances, _ = tree.query(self.hand['l_vertex'][self.time])
-                    if distances.min() < 0.05:
-                        if self.obj['l_contact_bbox'][self.time] is not None:
-                            if self.obj['l_contact_bbox'][self.time][-1] > distances.min(): [object_library.object_id_to_name_dict[k], c_box[k].box2d, distances.min()]
-                        else:
-                            self.obj['l_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, distances.min()]
+
+            # 왼손 접촉 처리
+            if overlap_left:
+                distances, _ = tree.query(self.hand['l_vertex'][self.time])
+                min_dist = distances.min()
+                if min_dist < 0.05:
+                    existing = self.obj['l_contact_bbox'].get(self.time)
+                    if existing is None or existing[-1] > min_dist:
+                        self.obj['l_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+
+            # 오른손 접촉 처리
+            if overlap_right:
+                distances, _ = tree.query(self.hand['r_vertex'][self.time])
+                min_dist = distances.min()
+                if min_dist < 0.05:
+                    existing = self.obj['r_contact_bbox'].get(self.time)
+                    if existing is None or existing[-1] > min_dist:
+                        self.obj['r_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+
+
+
                     
             
         # If some object are not visible, we clear the bounding box visualization
@@ -643,7 +653,7 @@ func_dict = {
 hot3d = Hot3DVisualizer(hot3d_data_provider, HandType.Mano, **func_dict)
 
 
-timestamps = timestamps[100:130]
+timestamps = timestamps[:]
 
 
 flag = False
@@ -692,6 +702,9 @@ class_id = [label_to_class[label] for label in gazing_obj]
 output.hand.update({k: dict(v) for k, v in output.hand.items() if isinstance(v, defaultdict)})
 output.obj.update({k: dict(v) for k, v in output.obj.items() if isinstance(v, defaultdict)})
 
+# 1. hand와 object의 bbox가 겹치는 HOI 상황일 때, Gaze point가 그 안에 속해 있는 비율
+#     ==>  [(Gaze_point가 안에 속해있는 frame) / (HOI 상황의 frame)]을 모두 더한 뒤, 평균을 냄 
+
 for idx, (time, txt) in enumerate(output.gaze_list.items()):
     if idx != time:
         ValueError, f"{idx} != {time}"
@@ -700,39 +713,6 @@ for idx, (time, txt) in enumerate(output.gaze_list.items()):
         txt[0],
         rr.Points2D(txt[1], radii=20, labels=gaze_logs[idx][1], class_ids=class_id),
     )
-    
-    # contact_hand = False
-
-    # # 각 hand-object 쌍이 None이 아닌 경우에만 box 계산
-    # right_hand_box = output.hand['right'][idx] if idx in output.hand['right'].keys() else 0
-    # left_hand_box = output.hand['left'][idx] if idx in output.hand['left'].keys() else 0
-    # obj_entry = output.obj['bbox'][idx]
-
-    # if right_hand_box:
-    #     obj_box = obj_entry[1]
-    #     if obj_box:
-    #         right = [right_hand_box.left, right_hand_box.left + right_hand_box.width,
-    #                 right_hand_box.top, right_hand_box.top + right_hand_box.height]
-    #         obj = [obj_box.left, obj_box.left + obj_box.width,
-    #                 obj_box.top, obj_box.top + obj_box.height]
-            
-    #         if is_overlap(right, obj) and obj_entry[0] == gaze_logs[idx][-2]:
-    #             contact_hand = f"Right hand interacting with {obj_entry[0]}"
-
-    # # 왼손도 동일하게 체크
-    # if left_hand_box:
-    #     obj_box = obj_entry[1]
-    #     if obj_box:
-    #         left = [left_hand_box.left, left_hand_box.left + left_hand_box.width,
-    #                 left_hand_box.top, left_hand_box.top + left_hand_box.height]
-    #         obj = [obj_box.left, obj_box.left + obj_box.width,
-    #                     obj_box.top, obj_box.top + obj_box.height]
-
-    #         if is_overlap(left, obj) and obj_entry[0] == gaze_logs[idx][-2]:
-    #             if contact_hand and "Right" in contact_hand:
-    #                 contact_hand = f"Both hand interacting with {obj_entry[0]}"
-    #             else:
-    #                 contact_hand = f"Left hand interacting with {obj_entry[0]}"
     
     if idx in output.obj['l_contact_bbox'].keys():
         contact_hand = f"left_hand is grasping with {output.obj['l_contact_bbox'][idx][0]}"
@@ -743,8 +723,6 @@ for idx, (time, txt) in enumerate(output.gaze_list.items()):
     else:
         contact_hand = None    
         
-    
-    
     if contact_hand:
         rr.log(
             txt[0] + "/box",
