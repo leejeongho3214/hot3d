@@ -147,7 +147,7 @@ class Hot3DVisualizer:
         for key, value in kargs.items():
             setattr(self, key, value)
         self.gaze_list = defaultdict(lambda: None)
-        self.obj = {'r_contact_bbox': defaultdict(lambda: None), 'vertex': defaultdict(), 'l_contact_bbox': defaultdict(lambda: None), 'bbox': defaultdict()}
+        self.obj = {'r_contact_bbox': defaultdict(lambda: None), 'vertex': defaultdict(), 'l_contact_bbox': defaultdict(lambda: None), 'l_bbox': defaultdict(lambda: None), 'r_bbox': defaultdict(lambda: None)}
         self.seq = []
         self.check_no_gaze = []
         self.hand = {'right': defaultdict(lambda: None), 'left': defaultdict(lambda: None), 'r_vertex': defaultdict(), 'l_vertex': defaultdict()}
@@ -544,10 +544,6 @@ class Hot3DVisualizer:
             
             logging_status[object_uid] = True
             
-            ## Save the visibility ratio of the object within the image.
-            if visibility_ratio > 0.9: 
-                self.vis_num[object_uid] += 1 
-                
             ## Acquire the duration for which the gaze remains within each object’s bounding box
             inside = Hot3DVisualizer.is_point_in_box(eye_gaze_reprojection_data, box)
             if inside and not self.in_box[object_uid]:
@@ -608,7 +604,7 @@ class Hot3DVisualizer:
                 
                 axis_aligned_box2d = box2d_collection_with_dt.box2d_collection.box2ds[k]
                 box = axis_aligned_box2d.box2d
-                self.obj['bbox'][self.time] = box
+                
 
             # 왼손 접촉 처리
             if overlap_left:
@@ -618,6 +614,7 @@ class Hot3DVisualizer:
                     existing = self.obj['l_contact_bbox'].get(self.time)
                     if existing is None or existing[-1] > min_dist:
                         self.obj['l_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+                        self.obj['l_bbox'][self.time] = [box, object_library.object_id_to_name_dict[k]]
 
             # 오른손 접촉 처리
             if overlap_right:
@@ -627,6 +624,8 @@ class Hot3DVisualizer:
                     existing = self.obj['r_contact_bbox'].get(self.time)
                     if existing is None or existing[-1] > min_dist:
                         self.obj['r_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+                        self.obj['r_bbox'][self.time] = [box, object_library.object_id_to_name_dict[k]]
+                        
 
         # If some object are not visible, we clear the bounding box visualization
         for key, value in logging_status.items():
@@ -636,7 +635,7 @@ class Hot3DVisualizer:
                     f"world/device/{stream_id}_raw/bbox/{object_name}",
                     rr.Clear.flat(),
                 )
-# rr.init("Hot3D", spawn=True)
+rr.init("Hot3D", spawn=True)
 
 stream_id = StreamId("214-1")
 device_data_provider = hot3d_data_provider.device_data_provider
@@ -653,7 +652,7 @@ func_dict = {
 hot3d = Hot3DVisualizer(hot3d_data_provider, HandType.Mano, **func_dict)
 
 
-timestamps = timestamps[:500]
+timestamps = timestamps[:]
 
 
 flag = False
@@ -711,10 +710,11 @@ start_idx = None
 for idx, (time, txt) in tqdm(enumerate(output.gaze_list.items()), desc="Step 3"):
     if idx != time:
         ValueError, f"{idx} != {time}"
+        
     rr.set_time_sequence("frame", idx)
     rr.log(
         txt[0],
-        rr.Points2D(txt[1], radii=20, labels=gaze_logs[idx][1], class_ids=class_id),
+        rr.Points2D(txt[1], radii=20, labels=gaze_logs[idx][1], class_ids=[class_id[idx]]),
     )
     
     if idx in output.obj['l_contact_bbox'].keys():
@@ -726,12 +726,18 @@ for idx, (time, txt) in tqdm(enumerate(output.gaze_list.items()), desc="Step 3")
     else:
         contact_hand = None    
         
+    if contact_hand:
+        c_hand = output.obj['l_contact_bbox'][idx][0] if contact_hand.split('_')[0] == "left" else output.obj['r_contact_bbox'][idx][0]
+        
     if contact_hand and not in_contact:
         start_idx = idx
         in_contact = True
     elif not contact_hand and in_contact:
-        total_list.append([start_idx, idx - 1])
+        total_list.append([start_idx, idx - 1, c_hand])
         in_contact = False
+        
+    elif in_contact and idx == len(output.gaze_list) - 1:
+        total_list.append([start_idx, idx, c_hand])
         
     if contact_hand:
         rr.log(
@@ -758,7 +764,7 @@ def is_point_in_bbox(point, bbox):
     return x_min <= x <= x_max and y_min <= y <= y_max
         
 def compute_section_ratio(section, output):
-    start, end = section
+    start, end = section[:2]
     inside_count = 0
     total_count = 0
 
@@ -767,22 +773,27 @@ def compute_section_ratio(section, output):
             continue  # 데이터 없는 프레임 무시
 
         points = output.gaze_list[idx][1]  # Points2D 좌표 배열
-        bbox_info = output.obj['bbox'].get(idx)
+        l_bbox_info = output.obj['l_bbox'].get(idx)
+        r_bbox_info = output.obj['r_bbox'].get(idx)
 
-        if bbox_info is None:
+        if all(key == None for key in [l_bbox_info, r_bbox_info]):
             continue  # bbox 없는 프레임 무시
 
-        bbox = bbox_info  # .left, .top, .width, .height
-
-        for point in points:
-            total_count += 1
-            if is_point_in_bbox(point, bbox):
-                inside_count += 1
+        total_count += 1
+        if any(is_point_in_bbox(points, bbox_pos[0]) for bbox_pos in [l_bbox_info, r_bbox_info] if bbox_pos is not None):
+            inside_count += 1
+            
 
     return inside_count / total_count if total_count > 0 else 0
         
-ratios = [compute_section_ratio(section, output) for section in total_list]
-average_ratio = sum(ratios) / len(ratios) if ratios else 0
+ratios = defaultdict(list)
+
+for section in total_list:
+    if (section[1] - section[0]) > 60:
+        key = section[-1]  # 예: 구간 끝
+        value = compute_section_ratio(section, output)
+        ratios[key].append(value)
+average_ratio = [[key, round(sum(ratios[key]) / len(ratios[key]), 2)] for key in ratios.keys()]
 
 print("total:", total_list)
 print("구간별 비율:", ratios)
