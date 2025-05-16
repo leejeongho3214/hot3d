@@ -1,70 +1,15 @@
-# Section 0: DataProvider initialization
-# Take home message:
-# - Device data, such as Image data stream is indexed with a stream_id
-# - Intrinsics and Extrinsics calibration relative to the device coordinates is available for each CAMERA/stream_id
-#
-# Data Requirements:
-# - a sequence
-# - the object library
-# Optional:
-# - To use the Mano hand you need to have the LEFT/RIGHT *.pkl hand models (available)
-from data_loaders.loader_hand_poses import Handedness
 from collections import defaultdict
+import json
 import os
 import trimesh
 from rerun.archetypes import Boxes2D
 from dataset_api import Hot3dDataProvider
 from data_loaders.loader_object_library import load_object_library
 from data_loaders.mano_layer import MANOHandModel
-home = os.path.expanduser("~")
-hot3d_dataset_path = sequence_path = home + "/Desktop/P0003_ebdc6ff7"
-object_library_path = home +"/Desktop/assets"
-mano_hand_model_path = home + "/Desktop/mano_v1_2/models"
 from scipy.spatial import cKDTree
-signal = True
-from scipy.spatial import cKDTree
-if not os.path.exists(sequence_path) or not os.path.exists(object_library_path):
-    print("Invalid input sequence or library path.")
-    print("Please do update the path to VALID values for your system.")
-    raise
-#
-# Init the object library
-#
-object_library = load_object_library(object_library_folderpath=object_library_path)
 
-#
-# Init the HANDs model
-# If None, the UmeTrack HANDs model will be used
-#
-mano_hand_model = None
-if mano_hand_model_path is not None:
-    mano_hand_model = MANOHandModel(mano_hand_model_path)
 
-#
-# Initialize hot3d data provider
-#
-hot3d_data_provider = Hot3dDataProvider(
-    sequence_folder=sequence_path,
-    object_library=object_library,
-    mano_hand_model=mano_hand_model,
-)
-print(f"data_provider statistics: {hot3d_data_provider.get_data_statistics()}")
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from typing import Dict, List, Optional
+from typing import List, Optional
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -91,22 +36,11 @@ from data_loaders.ObjectBox2dDataProvider import (  # @manual
     ObjectBox2dProvider,
 )
 
-from data_loaders.ObjectPose3dProvider import (  # @manual
-    ObjectPose3dCollectionWithDt,
-    ObjectPose3dProvider,
-)
-
 from projectaria_tools.core.calibration import (
     CameraCalibration,
     DeviceCalibration,
     FISHEYE624,
     LINEAR,
-)
-from projectaria_tools.core.mps import get_eyegaze_point_at_depth  # @manual
-
-from projectaria_tools.core.mps.utils import (  # @manual
-    filter_points_from_confidence,
-    filter_points_from_count,
 )
 
 from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions  # @manual
@@ -115,6 +49,76 @@ from projectaria_tools.utils.rerun_helpers import (  # @manual
     AriaGlassesOutline,
     ToTransform3D,
 )
+
+home = os.path.expanduser("~")
+f_root = home + "/Dataset/ljh/dataset/hot3d/full-hot3d"
+folder_list = os.listdir(f_root)
+stream_id = StreamId("214-1")
+
+def find_name_obj(idx, start_idx, c_hand_list, output, txt):
+    valid_keys = [k for k in range(start_idx, idx) if c_hand_list.get(k) is not None]
+    object = []
+    
+    for valid_idx in valid_keys:
+        if c_hand_list[valid_idx].split('_')[0] == "left":
+            object.append(output.obj['l_contact_bbox'][valid_idx][0])
+            
+        elif c_hand_list[valid_idx].split('_')[0] in ["both-S", "right"]:
+            object.append(output.obj['r_contact_bbox'][valid_idx][0])
+            
+        elif c_hand_list[valid_idx].split('_')[0] == "both-D":
+            object.append(output.obj['l_contact_bbox'][valid_idx][0])
+            object.append(output.obj['r_contact_bbox'][valid_idx][0])
+            
+            # bbox_l, bbox_r = output.obj['l_contact_bbox'][valid_idx][1], output.obj['r_contact_bbox'][valid_idx][1]
+            # bbox_l_center, bbox_r_center = [int((bbox_l[0] + bbox_l[1])/2), int((bbox_l[2] + bbox_l[3])/2)], [int((bbox_r[0] + bbox_r[1])/2), int((bbox_r[2] + bbox_r[3])/2)]
+            
+            # if np.linalg.norm(txt[1] - bbox_l_center) < np.linalg.norm(txt[1] - bbox_r_center):
+            #     c_hand = ["both-Dl", output.obj['l_contact_bbox'][valid_idx][0]]
+            # else:
+            #     c_hand = ["both-Dr", output.obj['r_contact_bbox'][valid_idx][0]]
+    unique_obj = defaultdict(int)
+
+    for key in object:
+        unique_obj[key] += 1
+        
+    for key in object:
+        if unique_obj[key] < 60:
+            del unique_obj[key]
+    
+    return list(unique_obj.keys())
+
+
+def is_point_in_bbox(point, bbox):
+    x, y = point
+    x_min = bbox.left
+    x_max = bbox.left + bbox.width
+    y_min = bbox.top
+    y_max = bbox.top + bbox.height
+    return x_min <= x <= x_max and y_min <= y <= y_max
+        
+def compute_section_ratio(section, output):
+    start, end = section[:2]
+    inside_count = 0
+    total_count = 0
+
+    for idx in range(start, end + 1):
+        if idx not in output.gaze_list:
+            continue  # 데이터 없는 프레임 무시
+
+        points = output.gaze_list[idx][1]  # Points2D 좌표 배열
+        l_bbox_info = output.obj['l_bbox'].get(idx)
+        r_bbox_info = output.obj['r_bbox'].get(idx)
+
+        if all(key == None for key in [l_bbox_info, r_bbox_info]):
+            continue  # bbox 없는 프레임 무시
+
+        total_count += 1
+        if any(is_point_in_bbox(points, bbox_pos[0]) for bbox_pos in [l_bbox_info, r_bbox_info] if bbox_pos is not None):
+            inside_count += 1
+            
+
+    return [inside_count, total_count] if total_count > 0 else 0
 
 def get_bbox_center(box):
     cx = box.left + box.width / 2
@@ -133,8 +137,8 @@ def is_overlap(box1, box2):
     
     # 겹치는 경우: min-max 사이에 교차점이 있어야 함
     return not (x1_max < x2_min or x2_max < x1_min or
-                y1_max < y2_min or y2_max < y1_min)     
-
+                y1_max < y2_min or y2_max < y1_min)   
+        
 class Hot3DVisualizer:
     def __init__(
         self,
@@ -142,15 +146,16 @@ class Hot3DVisualizer:
         hand_type: HandType = HandType.Umetrack,
         **kargs
     ) -> None:
-        
+
         ## Load the item to be saved
         for key, value in kargs.items():
             setattr(self, key, value)
         self.gaze_list = defaultdict(lambda: None)
         self.obj = {'r_contact_bbox': defaultdict(lambda: None), 'vertex': defaultdict(), 'l_contact_bbox': defaultdict(lambda: None), 'l_bbox': defaultdict(lambda: None), 'r_bbox': defaultdict(lambda: None)}
         self.seq = []
+        self.image = defaultdict(lambda: None)
         self.check_no_gaze = []
-        self.hand = {'right': defaultdict(lambda: None), 'left': defaultdict(lambda: None), 'r_vertex': defaultdict(), 'l_vertex': defaultdict()}
+        self.hand = {'right': defaultdict(lambda: None), 'left': defaultdict(lambda: None), 'r_vertex': defaultdict(lambda: None), 'l_vertex': defaultdict(lambda: None)}
         ############################################################
         
         self._hot3d_data_provider = hot3d_data_provider
@@ -214,7 +219,7 @@ class Hot3DVisualizer:
         ## Retrieve and log data that is not stream_id dependent (pure 3D data)
         #
         acceptable_time_delta = 0
-        
+        self.flag = flag
         ## Add frame info
         self.time = idx
 
@@ -287,30 +292,33 @@ class Hot3DVisualizer:
                     else f"world/device/{stream_id}_raw/eye-gaze_projection_raw"
                 )
                 
-                if camera_configurations != LINEAR: self.gaze_list[self.time] = [label, eye_gaze_reprojection_data]
+                if camera_configurations != LINEAR: 
+                    self.gaze_list[self.time] = [label, list(eye_gaze_reprojection_data)]
                 # rr.log(
                 #     label,
                 #     rr.Points2D(eye_gaze_reprojection_data, radii=20),
                 #     # TODO consistent color and size depending of camera resolution
                 # )
 
-            # Undistorted image (required if you want see reprojected 3D mesh on the images)
-            image_data = self._device_data_provider.get_undistorted_image(
-                timestamp_ns, stream_id
-            )
-            if image_data is not None:
-                rr.log(
-                    f"world/device/{stream_id}",
-                    rr.Image(image_data).compress(jpeg_quality=self._jpeg_quality),
-                )
+            # # Undistorted image (required if you want see reprojected 3D mesh on the images)
+            # image_data = self._device_data_provider.get_undistorted_image(
+            #     timestamp_ns, stream_id
+            # )
+            # if image_data is not None:
+            #     rr.log(
+            #         f"world/device/{stream_id}",
+            #         rr.Image(image_data).compress(jpeg_quality=self._jpeg_quality),
+            #     )
 
-            # Raw device images (required for object bounding box visualization)
+            # # Raw device images (required for object bounding box visualization)
             image_data = self._device_data_provider.get_image(timestamp_ns, stream_id)
             if image_data is not None:
-                rr.log(
-                    f"world/device/{stream_id}_raw",
-                    rr.Image(image_data).compress(jpeg_quality=self._jpeg_quality),
-                )
+                self.image[self.time] = timestamp_ns
+                
+                # rr.log(
+                #     f"world/device/{stream_id}_raw",
+                #     rr.Image(image_data).compress(jpeg_quality=self._jpeg_quality),
+                # )
 
             if (
                 self._object_box2d_data_provider is not None
@@ -394,7 +402,7 @@ class Hot3DVisualizer:
             return
 
         hand_pose_collection = hand_poses_with_dt.pose3d_collection
-        hand_box2d_data_provider = hot3d_data_provider.hand_box2d_data_provider
+        hand_box2d_data_provider = self._hot3d_data_provider.hand_box2d_data_provider
         
         box2d_collection_with_dt = (
             hand_box2d_data_provider.get_bbox_at_timestamp(
@@ -517,7 +525,7 @@ class Hot3DVisualizer:
         global signal
         if signal:
             signal = False
-            for object_uid in hot3d_data_provider.object_box2d_data_provider.object_uids:
+            for object_uid in self._hot3d_data_provider.object_box2d_data_provider.object_uids:
                 object_cad_asset_filepath = ObjectLibrary.get_cad_asset_path(
                     object_library_folderpath=object_library.asset_folder_name,
                     object_id=object_uid,
@@ -555,7 +563,7 @@ class Hot3DVisualizer:
                 self.in_box[object_uid] = False
                 
             ## Fix the issue where the duration was skipped on the last frame.
-            if flag and inside:
+            if self.flag and inside:
                 self.durations[object_uid].append([self.enter_time[object_uid], self.time, visibility_ratio])
             
             rr.log(
@@ -607,23 +615,23 @@ class Hot3DVisualizer:
                 
 
             # 왼손 접촉 처리
-            if overlap_left:
+            if overlap_left and self.hand['l_vertex'][self.time] is not None:
                 distances, _ = tree.query(self.hand['l_vertex'][self.time])
                 min_dist = distances.min()
                 if min_dist < 0.05:
                     existing = self.obj['l_contact_bbox'].get(self.time)
                     if existing is None or existing[-1] > min_dist:
-                        self.obj['l_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+                        self.obj['l_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], obj, min_dist]
                         self.obj['l_bbox'][self.time] = [box, object_library.object_id_to_name_dict[k]]
 
             # 오른손 접촉 처리
-            if overlap_right:
+            if overlap_right and self.hand['r_vertex'][self.time] is not None:
                 distances, _ = tree.query(self.hand['r_vertex'][self.time])
                 min_dist = distances.min()
                 if min_dist < 0.05:
                     existing = self.obj['r_contact_bbox'].get(self.time)
                     if existing is None or existing[-1] > min_dist:
-                        self.obj['r_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], c_box[k].box2d, min_dist]
+                        self.obj['r_contact_bbox'][self.time] = [object_library.object_id_to_name_dict[k], obj, min_dist]
                         self.obj['r_bbox'][self.time] = [box, object_library.object_id_to_name_dict[k]]
                         
 
@@ -635,169 +643,244 @@ class Hot3DVisualizer:
                     f"world/device/{stream_id}_raw/bbox/{object_name}",
                     rr.Clear.flat(),
                 )
-rr.init("Hot3D", spawn=True)
-
-stream_id = StreamId("214-1")
-device_data_provider = hot3d_data_provider.device_data_provider
-timestamps = device_data_provider.get_sequence_timestamps()
-object_box2d_data_provider = hot3d_data_provider.object_box2d_data_provider
-object_uids = list(object_box2d_data_provider.object_uids)
-
-func_dict = {
-    'vis_num':      {uid: 0      for uid in object_uids},
-    'in_box':       {uid: False  for uid in object_uids},
-    'enter_time':   {uid: None   for uid in object_uids},
-    'durations':    {uid: []     for uid in object_uids},
-}
-hot3d = Hot3DVisualizer(hot3d_data_provider, HandType.Mano, **func_dict)
-
-
-timestamps = timestamps[:]
-
-
-flag = False
-for idx, time in tqdm(enumerate(timestamps), desc="Step 1"):
-    if idx == len(timestamps) - 1: flag = True
-    rr.set_time_sequence("frame", idx)
-    output = hot3d.log_dynamic_assets([stream_id], time, idx, flag)
-output.vis_num = {output._object_library.object_id_to_name_dict.get(k, k): v for k, v in output.vis_num.items()}
-output.durations = {output._object_library.object_id_to_name_dict.get(k, k): v for k, v in output.durations.items()}
-
-## Define the label for the gaze point indicating the target being gazed at
-gaze_logs = []
-gazing_obj = []
-for idx, _ in tqdm(enumerate(timestamps), desc="Step 2"):
-    gazing_msgs = []
-    for obj_name, intervals in output.durations.items():
-        for start, end, vis_ratio in intervals:
-            if start <= idx <= end:
-                duration_frames = end - start
-                gazing_msgs.append([f"Gazing at {obj_name} for {idx-start} of {duration_frames} frames", vis_ratio, obj_name])
-                break  
-            
-    if gazing_msgs:
-        if len(gazing_msgs) > 1:
-            gaze_logs.append([2, max(gazing_msgs, key=lambda x: x[1])[0], max(gazing_msgs, key=lambda x: x[1])[-1], "Interacting now"])
-        else:
-            gaze_logs.append([2, gazing_msgs[0][0], gazing_msgs[0][-1], 0])
                 
-        gazing_obj.append(gazing_msgs[0][-1])
-    else:
-        gaze_logs.append([1, "Not Gazing", 0,0])
-        gazing_obj.append(None)
-        
+                
+                
+def main(f_name):
+    global signal
+    signal = True
 
-if len(output.gaze_list) != len(gaze_logs): 
-    raise ValueError(f"{len(output.gaze_list)} != {len(gaze_logs)}")
+    save_total = defaultdict(lambda: defaultdict(list))
+    sequence_path = os.path.join(f_root, f_name) 
+    object_library_path = home +"/Dataset/ljh/dataset/hot3d/assets"
+    mano_hand_model_path = home + "/dir/mano_v1_2/models"
 
-# 고유값 추출 및 인덱스 부여
-unique_labels = list(set(gazing_obj))
-label_to_class = {label: idx + 1 for idx, label in enumerate(unique_labels)}
+    if not os.path.exists(sequence_path) or not os.path.exists(object_library_path):
+        print("Invalid input sequence or library path.")
+        print("Please do update the path to VALID values for your system.")
+        raise
+    #
+    # Init the object library
+    #
+    object_library = load_object_library(object_library_folderpath=object_library_path)
 
-# 매핑
-class_id = [label_to_class[label] for label in gazing_obj]
+    #
+    # Init the HANDs model
+    # If None, the UmeTrack HANDs model will be used
+    #
+    mano_hand_model = None
+    if mano_hand_model_path is not None:
+        mano_hand_model = MANOHandModel(mano_hand_model_path)
 
-## Need to convert defaultdict to dict where it is too volatile
-output.hand.update({k: dict(v) for k, v in output.hand.items() if isinstance(v, defaultdict)})
-output.obj.update({k: dict(v) for k, v in output.obj.items() if isinstance(v, defaultdict)})
-
-# 1. hand와 object의 bbox가 겹치는 HOI 상황일 때, Gaze point가 그 안에 속해 있는 비율
-#     ==>  [(Gaze_point가 안에 속해있는 frame) / (HOI 상황의 frame)]을 모두 더한 뒤, 평균을 냄 
-
-total_list = []
-in_contact = False
-start_idx = None
-for idx, (time, txt) in tqdm(enumerate(output.gaze_list.items()), desc="Step 3"):
-    if idx != time:
-        ValueError, f"{idx} != {time}"
-        
-    rr.set_time_sequence("frame", idx)
-    rr.log(
-        txt[0],
-        rr.Points2D(txt[1], radii=20, labels=gaze_logs[idx][1], class_ids=[class_id[idx]]),
+    #
+    # Initialize hot3d data provider
+    #
+    hot3d_data_provider = Hot3dDataProvider(
+        sequence_folder=sequence_path,
+        object_library=object_library,
+        mano_hand_model=mano_hand_model,
     )
+    print(f"data_provider statistics: {hot3d_data_provider.get_data_statistics()}")
+
+    # Copyright (c) Meta Platforms, Inc. and affiliates.
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    #     http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+  
+    # rr.init("Hot3D", spawn=True)
+
+    stream_id = StreamId("214-1")
+    device_data_provider = hot3d_data_provider.device_data_provider
+    timestamps = device_data_provider.get_sequence_timestamps()
     
-    if idx in output.obj['l_contact_bbox'].keys():
-        contact_hand = f"left_hand is grasping with {output.obj['l_contact_bbox'][idx][0]}"
-        if idx in output.obj['r_contact_bbox'].keys():
-            contact_hand = f"both_hand is grasping with {output.obj['r_contact_bbox'][idx][0]}"
-    elif idx in output.obj['r_contact_bbox'].keys():
-        contact_hand = f"right_hand is grasping with {output.obj['r_contact_bbox'][idx][0]}"
-    else:
-        contact_hand = None    
+    object_box2d_data_provider = hot3d_data_provider.object_box2d_data_provider
+    object_uids = list(object_box2d_data_provider.object_uids)
+
+    func_dict = {
+        'in_box':       {uid: False  for uid in object_uids},
+        'enter_time':   {uid: None   for uid in object_uids},
+        'durations':    {uid: []     for uid in object_uids},
+    }
+    hot3d = Hot3DVisualizer(hot3d_data_provider, HandType.Mano, **func_dict)
+
+    flag = False
+    for idx, time in tqdm(enumerate(timestamps), desc="Step 1"):
+        if idx == len(timestamps) - 1: 
+            flag = True
+        rr.set_time_sequence("frame", idx)
+        output = hot3d.log_dynamic_assets([stream_id], time, idx, flag)
         
-    if contact_hand:
-        c_hand = output.obj['l_contact_bbox'][idx][0] if contact_hand.split('_')[0] == "left" else output.obj['r_contact_bbox'][idx][0]
-        
-    if contact_hand and not in_contact:
-        start_idx = idx
-        in_contact = True
-    elif not contact_hand and in_contact:
-        total_list.append([start_idx, idx - 1, c_hand])
-        in_contact = False
-        
-    elif in_contact and idx == len(output.gaze_list) - 1:
-        total_list.append([start_idx, idx, c_hand])
-        
-    if contact_hand:
+    ## Change the uid of object to name
+    output.durations = {output._object_library.object_id_to_name_dict.get(k): v for k, v in output.durations.items()}
+    
+    ## Need to convert defaultdict to dict where it is too volatile
+    output.gaze_list = dict(output.gaze_list)   
+    output.hand.update({k: dict(v) for k, v in output.hand.items() if isinstance(v, defaultdict)})
+    output.obj.update({k: dict(v) for k, v in output.obj.items() if isinstance(v, defaultdict)})
+
+    ## Define the label for the gaze point indicating the target being gazed at
+    gaze_logs = []
+    gazing_obj = []
+    for idx, _ in tqdm(enumerate(timestamps), desc="Step 2"):
+        gazing_msgs = []
+        for obj_name, intervals in output.durations.items():
+            for start, end, vis_ratio in intervals:
+                if start <= idx <= end:
+                    duration_frames = end - start
+                    gazing_msgs.append([f"Gazing at {obj_name} for {idx-start} of {duration_frames} frames", vis_ratio, obj_name])
+                    break  
+                
+        if gazing_msgs:
+            if len(gazing_msgs) > 1:
+                gaze_logs.append([2, max(gazing_msgs, key=lambda x: x[1])[0], max(gazing_msgs, key=lambda x: x[1])[-1], "Interacting now"])
+            else:
+                gaze_logs.append([2, gazing_msgs[0][0], gazing_msgs[0][-1], 0])
+                    
+            gazing_obj.append(gazing_msgs[0][-1])
+        else:
+            gaze_logs.append([1, "Not Gazing", 0,0])
+            gazing_obj.append(None)
+            
+
+
+    # 고유값 추출 및 인덱스 부여
+    unique_labels = list(set(gazing_obj))
+    label_to_class = {label: idx + 1 for idx, label in enumerate(unique_labels)}
+
+    # 매핑
+    class_id = [label_to_class[label] for label in gazing_obj]
+
+    # 1. hand와 object의 bbox가 겹치는 HOI 상황일 때, Gaze point가 그 안에 속해 있는 비율
+    #     ==>  [(Gaze_point가 안에 속해있는 frame) / (HOI 상황의 frame)]을 모두 더한 뒤, 평균을 냄 
+    total_list = []
+    c_hand_list = defaultdict(lambda: None)
+    contact_flag = False
+    start_idx = None
+    
+    for idx in tqdm(range(len(timestamps)), desc = "Step 3"):
+        if idx not in output.gaze_list.keys():
+            continue
+        txt = output.gaze_list[idx]
+        rr.set_time_sequence("frame", idx)
         rr.log(
-            txt[0] + "/box",
-            Boxes2D(
-                mins=[0, 0],  # 좌상단
-                sizes=[1480, 1480],  # 해상도 맞게 조정
-                colors=[255, 0, 0],
-                draw_order=100,
-                labels=contact_hand,
-            ),
+            txt[0],
+            rr.Points2D(txt[1], radii=20, labels=gaze_logs[idx][1], class_ids=[class_id[idx]]),
         )
-    else:
-        rr.log(
-            txt[0] + "/box",
-            rr.Clear.flat())
-    
-def is_point_in_bbox(point, bbox):
-    x, y = point
-    x_min = bbox.left
-    x_max = bbox.left + bbox.width
-    y_min = bbox.top
-    y_max = bbox.top + bbox.height
-    return x_min <= x <= x_max and y_min <= y <= y_max
         
-def compute_section_ratio(section, output):
-    start, end = section[:2]
-    inside_count = 0
-    total_count = 0
-
-    for idx in range(start, end + 1):
-        if idx not in output.gaze_list:
-            continue  # 데이터 없는 프레임 무시
-
-        points = output.gaze_list[idx][1]  # Points2D 좌표 배열
-        l_bbox_info = output.obj['l_bbox'].get(idx)
-        r_bbox_info = output.obj['r_bbox'].get(idx)
-
-        if all(key == None for key in [l_bbox_info, r_bbox_info]):
-            continue  # bbox 없는 프레임 무시
-
-        total_count += 1
-        if any(is_point_in_bbox(points, bbox_pos[0]) for bbox_pos in [l_bbox_info, r_bbox_info] if bbox_pos is not None):
-            inside_count += 1
+        if idx in output.obj['l_contact_bbox'].keys():
+            contact_hand = f"left_hand is grasping with {output.obj['l_contact_bbox'][idx][0]}"
+            if idx in output.obj['r_contact_bbox'].keys():
+                if output.obj['r_contact_bbox'][idx][0] == output.obj['l_contact_bbox'][idx][0]:
+                    contact_hand = f"both-S_hand is grasping with same {output.obj['r_contact_bbox'][idx][0]}"
+                else:
+                    contact_hand = f"both-D_hand is grasping with each object, {output.obj['l_contact_bbox'][idx][0]} and {output.obj['r_contact_bbox'][idx][0]}"
+        elif idx in output.obj['r_contact_bbox'].keys():
+            contact_hand = f"right_hand is grasping with {output.obj['r_contact_bbox'][idx][0]}"
+        else:
+            contact_hand = None  
             
-
-    return inside_count / total_count if total_count > 0 else 0
+        c_hand_list[idx] = contact_hand
+            
+        if contact_hand and not contact_flag:
+            start_idx = idx
+            contact_flag = True
+                        
+        elif not contact_hand and contact_flag:
+            contact_flag = False
+            if (idx - start_idx) < 60:
+                continue
+            
+            c_hand = find_name_obj(idx, start_idx, c_hand_list, output, txt)
+            total_list.append([start_idx, idx - 1, c_hand])
+            
+        else:
+            if contact_hand and idx == len(timestamps) - 1 and contact_flag and (idx - start_idx) > 60:
+                c_hand = find_name_obj(idx, start_idx, c_hand_list, output, txt)
+                total_list.append([start_idx, idx, c_hand])
+            
+        if contact_hand:
+            rr.log(
+                txt[0] + "/box",
+                Boxes2D(
+                    mins=[0, 0],  # 좌상단
+                    sizes=[1480, 1480],  # 해상도 맞게 조정
+                    colors=[255, 0, 0],
+                    draw_order=100,
+                    labels=contact_hand,
+                ),
+            )
+        else:
+            rr.log(
+                txt[0] + "/box",
+                rr.Clear.flat())
+            
+    ratios = defaultdict(lambda: defaultdict(list))
+    import cv2
+    number_action = 0
+    for section in total_list:
+        key = section[-1]
+        if len(key) > 1: 
+            key = "&".join(key)
+            o_num = "double"
+        elif len(key) == 1:
+            key = key[0]    
+            o_num = "single"
+        else:   
+            key = "error"
+            o_num = "error"
         
-ratios = defaultdict(list)
-
-for section in total_list:
-    if (section[1] - section[0]) > 60:
-        key = section[-1]  # 예: 구간 끝
         value = compute_section_ratio(section, output)
-        ratios[key].append(value)
-average_ratio = [[key, round(sum(ratios[key]) / len(ratios[key]), 2)] for key in ratios.keys()]
-
-print("total:", total_list)
-print("구간별 비율:", ratios)
-print("전체 평균 비율:", average_ratio)
+        ratios[o_num][key].append([value, section[:2]])
+        save_point = list(range(section[0], section[1], 30))
+        number_action += 1
         
+        for point in save_point:
+            if output.image[point] is None: 
+                os.makedirs(f"save_img/{f_name}", exist_ok=True)
+                cv2.imwrite(os.path.join(f"save_img/{f_name}", f"{key}_{number_action}_{point}_Skip.jpg"), np.zeros((224, 224, 1)))
             
+            image = output._device_data_provider.get_image(output.image[point], stream_id)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            os.makedirs(f"save_img/{o_num}/{f_name}", exist_ok=True)
+            cv2.imwrite(os.path.join(f"save_img/{o_num}/{f_name}", f"{key}_{number_action}_{point}.jpg"), image)
+
+    save_total[f_name] = ratios
+    save_total = {
+        key: sorted(value, key = lambda x: x[1][0]) for key, value in dict(save_total[f_name]).items()
+    }    
+    os.makedirs("analysis", exist_ok=True)
+    with open(f"analysis/{f_name}.json", "w") as f:
+        json.dump(save_total, f)
+        f.close()
     
+    os.makedirs("Full-analysis", exist_ok=True)
+    
+    output.obj['vertex'] = {output._object_library._object_id_to_name_dict[key]: [list(v) for v in value] for key, value in output.obj['vertex'].items()}
+    output.obj['l_bbox'] = {key: [[value[0].left, value[0].right, value[0].top, value[0].bottom], value[1]] for key, value in output.obj['l_bbox'].items() }
+    output.obj['r_bbox'] = {key: [[value[0].left, value[0].right, value[0].top, value[0].bottom], value[1]] for key, value in output.obj['r_bbox'].items() }
+    
+    total_dict = {
+        "meta": {"total_frame": len(timestamps), "seq_name": f_name, "object": [output._object_library._object_id_to_name_dict[uid] for uid in object_uids]},
+        "gaze": output.gaze_list,
+        "contact": output.obj
+    }
+
+    with open(f"Full-analysis/{f_name}.json", "w") as f:
+        json.dump(total_dict, f)
+        f.close()
+                
+if __name__ == "__main__":
+    home = os.path.expanduser("~")
+    with open(f"{home}/dir/hot3d/obj.json", "r") as f:
+        a = json.load(f)
+        for f_name in a[1]:
+            main(f_name.split('.')[0])
