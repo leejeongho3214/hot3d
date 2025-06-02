@@ -17,7 +17,7 @@ from dataset_api import Hot3dDataProvider
 from data_loaders.loader_object_library import load_object_library
 from data_loaders.mano_layer import MANOHandModel
 home = os.path.expanduser("~")
-hot3d_dataset_path = sequence_path = home + "/Desktop/P0003_ebdc6ff7"
+hot3d_dataset_path = sequence_path = home + "/Desktop/dataset/P0001_9b6feab7"
 object_library_path = home +"/Desktop/assets"
 mano_hand_model_path = home + "/Desktop/mano_v1_2/models"
 from scipy.spatial import cKDTree
@@ -709,7 +709,7 @@ in_contact = False
 start_idx = None
 for idx, (time, txt) in tqdm(enumerate(output.gaze_list.items()), desc="Step 3"):
     if idx != time:
-        ValueError, f"{idx} != {time}"
+        raise ValueError(f"{idx} != {time}")
         
     rr.set_time_sequence("frame", idx)
     rr.log(
