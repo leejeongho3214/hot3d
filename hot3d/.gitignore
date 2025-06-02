@@ -2,3 +2,7 @@
 .pixi
 # dataset download instruction
 /dataset/**
+
+*.ipynb
+
+__pycache__/
