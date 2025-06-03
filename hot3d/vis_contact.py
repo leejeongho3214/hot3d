@@ -1,6 +1,45 @@
-import rerun as rr
+import json
+import os
 import numpy as np
+import rerun as rr
+import torch
+import scipy.spatial.transform
+from data_loaders.loader_object_library import ObjectLibrary
+from data_loaders.loader_object_library import load_object_library
 
+# 사용자 홈 디렉토리 경로
+home = os.path.expanduser("~")
+
+# 데이터 로딩
+with open(home + "/Desktop/analysis/vase.json", "r") as f:
+    serializable_list = json.load(f)
+
+# 오브젝트 라이브러리 로딩
+object_library_path = home + "/Desktop/assets"
+object_library = load_object_library(object_library_folderpath=object_library_path)
+object_uid = object_library.object_name_to_id_dict["vase"]
+
+# rerun 초기화
+rr.init("HOI-Contact", spawn=True)
+object_cad_asset_filepath = ObjectLibrary.get_cad_asset_path(
+    object_library_folderpath=object_library.asset_folder_name,
+    object_id=object_uid,
+)
+
+# 기준 위치 (모든 오브젝트를 이곳으로 정렬)
+target_pos = np.array([0.0, 0.0, 0.0])
+target_rot = np.array([0.0, 0.0, 0.0, 1.0])  # 단위 quaternion (w=1)
+
+# 변환 함수 정의
+def transform_points(points, translation, quaternion):
+    rot = scipy.spatial.transform.Rotation.from_quat(quaternion)
+    return rot.apply(points) + translation
+
+def inverse_transform(points, translation, quaternion):
+    rot = scipy.spatial.transform.Rotation.from_quat(quaternion)
+    return rot.inv().apply(points - translation)
+
+# 시각화 루프
 for idx, (hand_, wrist_, obj_, side_) in enumerate(serializable_list):
     rr.set_time_seconds("timestamp", idx)
 
@@ -60,13 +99,23 @@ for idx, (hand_, wrist_, obj_, side_) in enumerate(serializable_list):
     canonical_verts = inverse_transform(verts, wrist_pos, wrist_quat)
     canonical_normals = inverse_transform(norms, wrist_pos, wrist_quat)
 
-    # 2. 기준 위치에 위치시킴 (PA-MPJPE처럼 위치만 통일)
+    # ✨ 좌우 뒤집기: 왼손일 경우 X축 뒤집기
+    if side_[-1] == "left":
+        canonical_verts[:, 0] *= -1
+        canonical_normals[:, 0] *= -1
+
+    # ✨ 1.5. mesh 중심 맞추기 → 완전히 겹치게 하기
+    mesh_center = np.mean(canonical_verts, axis=0)
+    canonical_verts -= mesh_center
+    canonical_normals -= mesh_center
+
+    # 2. 기준 위치에 위치시킴 (0,0,0 기준)
     aligned_verts = canonical_verts + target_pos
     aligned_normals = canonical_normals + target_pos
 
     # 3. 로그
     rr.log(
-        f"world/hand_sort/{idx}",
+        f"world/hand_sort",
         rr.Mesh3D(
             vertex_positions=aligned_verts.astype(np.float32),
             triangle_indices=tris.astype(np.int32),
