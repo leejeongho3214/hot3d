@@ -17,7 +17,7 @@ from data_loaders.loader_object_library import load_object_library
 from data_loaders.mano_layer import MANOHandModel
 
 home = os.path.expanduser("~")
-hot3d_dataset_path = sequence_path = home + "/Desktop/dataset/P0001_9b6feab7"
+hot3d_dataset_path = sequence_path = home + "/Desktop/P0001_10a27bf7"
 object_library_path = home +"/Desktop/assets"
 mano_hand_model_path = home + "/Desktop/mano_v1_2/models"
 
@@ -178,6 +178,12 @@ left_hand_pose_translations = []
 right_hand_pose_translations = []
 vertex_hit_counter = defaultdict(lambda: defaultdict(int))
 
+points = hot3d_data_provider.device_data_provider._mps_data_provider.get_semidense_point_cloud()
+filtered_points = [p for p in points if p.distance_std < 0.0005]
+positions = np.array([p.position_world for p in filtered_points])
+
+print(len(positions))
+
 traj_list = []
 # Retrieve the position of the device in the world frame at a given timestamp
 for idx, timestamp_ns in tqdm(enumerate(timestamps)):
@@ -186,7 +192,8 @@ for idx, timestamp_ns in tqdm(enumerate(timestamps)):
     # rr.set_time_sequence("timestamp", timestamp_ns)
     rr.set_time_sequence("idx", idx)
     
-    
+    if idx == 0:
+        rr.log("world/semidense_pc", rr.Points3D(positions=positions, radii=0.001))
     # 3D Object 시각화 추가
     # 3D object pose 불러오기
     object_poses_with_dt = hot3d_data_provider.object_pose_data_provider.get_pose_at_timestamp(
@@ -230,6 +237,14 @@ for idx, timestamp_ns in tqdm(enumerate(timestamps)):
 
     gaze_direction = gaze_target - gaze_origin
     
+    rr.log(
+            "world/gaze_vector",
+            rr.Arrows3D(
+                origins=[gaze_origin],
+                vectors=[gaze_direction],
+        ), )
+
+    
     # 물체 Pose 불러오기
     object_poses_with_dt = hot3d_data_provider.object_pose_data_provider.get_pose_at_timestamp(
         timestamp_ns, TimeQueryOptions.CLOSEST, TimeDomain.TIME_CODE
@@ -255,7 +270,7 @@ for idx, timestamp_ns in tqdm(enumerate(timestamps)):
         handedness_label = hand_pose_data.handedness_label()
 
         T_world_wrist = hand_pose_data.wrist_pose
-        log_pose(pose=T_world_wrist, label=f"world/hand/{handedness_label}")
+        # log_pose(pose=T_world_wrist, label=f"world/hand/{handedness_label}")
 
         # Accumulate HAND poses translations as list, to show a LINE strip HAND trajectory
         if hand_pose_data.is_left_hand():
@@ -287,25 +302,27 @@ for idx, timestamp_ns in tqdm(enumerate(timestamps)):
             f"world/{handedness_label}/mesh_faces",
             rr.Mesh3D(
                 vertex_positions=hand_mesh_vertices,
-                triangle_indices=hand_triangles,
-                vertex_colors=[255, 255, 255]
-            ),
-        )
-    
-    
+                vertex_normals=hand_vertex_normals,
+                triangle_indices=hand_triangles
+            ),)
+
     for obj_id, obj_pose in object_poses_with_dt.pose3d_collection.poses.items():
         object_cad_asset_filepath = hot3d_data_provider.object_library.get_cad_asset_path(
                     object_library_folderpath=object_library.asset_folder_name,
                     object_id=obj_id,
                 )
-        
+ 
+        mesh = trimesh.load(object_cad_asset_filepath).to_geometry() 
+        normals = mesh.vertex_normals
         rr.log(
             f"world/mesh/{obj_id}",
-            rr.Asset3D(
-                path=object_cad_asset_filepath,
+            rr.Mesh3D(
+                vertex_positions=mesh.vertices,
+                vertex_normals=normals,
+                triangle_indices=mesh.faces,
             ),
         )
-        mesh = trimesh.load(object_cad_asset_filepath).to_geometry() 
+            
         
         T = object_poses_with_dt.pose3d_collection.poses[obj_id].T_world_object.to_matrix()
         vertices_local = mesh.vertices
@@ -313,149 +330,11 @@ for idx, timestamp_ns in tqdm(enumerate(timestamps)):
         vertices_world = (T @ vertices_homo.T).T[:, :3]
         
         obj_mesh[obj_id] = vertices_world
-        
-        scene_mesh = trimesh.Trimesh(vertices=vertices_world, faces=mesh.faces)
-        intersector = trimesh.ray.ray_triangle.RayMeshIntersector(scene_mesh)        
-        ray_origins = np.atleast_2d(np.asarray(gaze_origin).reshape(-1, 3))
-        ray_directions = np.atleast_2d(np.asarray(gaze_direction).reshape(-1, 3))
-        locations, index_ray, index_tri = intersector.intersects_location(
-            ray_origins, ray_directions
-        )
-        
+
         log_pose(pose=obj_pose.T_world_object, label=f"world/mesh/{obj_id}",)
         
-        rr.log(
-            "world/gaze_vector",
-            rr.Arrows3D(
-                origins=[gaze_origin],
-                vectors=[gaze_direction],
-            ), )
-        
-        stream_id = StreamId("214-1")
-        eye_gaze = device_data_provider.get_eye_gaze(timestamp_ns=timestamp_ns)
-        
-        headset_pose3d = headset_pose3d_with_dt.pose3d
-        T_world_device = headset_pose3d.T_world_device
-        
-        # Aria 카메라의 pose 구하기
-        camera_label = device_data_provider.get_image_stream_label(stream_id)
-        camera_calib = device_data_provider.get_device_calibration().get_camera_calib(camera_label)
-        T_device_camera = camera_calib.get_transform_device_camera()
-        T_world_camera = T_world_device @ T_device_camera
-
-        log_pose(T_world_camera, "world/camera_pose")
-
-        rr.log(
-            "world/viewpoint/camera",
-            rr.Transform3D(
-                    translation=T_world_camera.translation().tolist()[0],
-                    rotation=T_world_camera.rotation().to_quat().tolist()[0],
-                ),
-            static=True)
-        
-        T_device_cpf = hot3d_data_provider.device_data_provider.get_device_calibration().get_transform_device_cpf()
-        
-        gaze_vector_in_cpf = get_eyegaze_point_at_depth(
-            eye_gaze.yaw, eye_gaze.pitch, depth_m=1.0  # 벡터는 방향만 필요하니 depth 임의 고정
-        )
-        gaze_origin = (T_world_device @ T_device_cpf @ np.array([0, 0, 0]))
-        gaze_target = (T_world_device @ T_device_cpf @ gaze_vector_in_cpf)
-        gaze_direction = gaze_target - gaze_origin
-        
-        camera_model = FISHEYE624
-    
-        eye_gaze_reprojection_data = (
-            device_data_provider.get_eye_gaze_in_camera(
-                stream_id, timestamp_ns, camera_model=camera_model
-            )
-        )
-        if (
-            eye_gaze_reprojection_data is None
-            or not eye_gaze_reprojection_data.any()
-        ):
-            continue
-        
-        # 4. 교차 지점 시각화
-        if len(locations) > 0:
-            distances = np.linalg.norm(locations - ray_origins[0], axis=1)
-            nearest_index = np.argmin(distances)
-            nearest_location = locations[nearest_index]
-            nearest_distance = distances[nearest_index]
-            
-            vertex_hit_counter[obj_id][nearest_index] += 1
-
-            all_nearest.append({
-                "obj_id": obj_id,
-                "location": nearest_location,
-                "distance": nearest_distance
-            })
-
-            traj_list.append(nearest_location)
-            
-            sphere = trimesh.creation.icosphere(radius=0.01, subdivisions=2)
-            sphere.apply_translation(nearest_location)
-
-    # 모든 물체에 대한 후보 중 가장 가까운 것 선택
-    if len(all_nearest) > 0:
-        best = min(all_nearest, key=lambda x: x["distance"])
-        nearest_location = best["location"]
-
-        traj_list.append(nearest_location)
-
-        sphere = trimesh.creation.icosphere(radius=0.01, subdivisions=2)
-        sphere.apply_translation(nearest_location)
-
-        rr.log(
-            "world/intersection_point_sphere",
-            rr.Mesh3D(
-                vertex_positions=sphere.vertices,
-                triangle_indices=sphere.faces,
-                vertex_colors=[[255, 0, 0]]
-            )
-        )
-            
-    else:
-        rr.log(
-                f"world/intersection_point_sphere",
-                rr.Clear.flat(),
-            )
-    
-    image_stream_label = device_data_provider.get_image_stream_label(stream_id)
-    # Retrieve the image data for a given timestamp
-    image_data = device_data_provider.get_image(timestamp_ns, stream_id)
-    # Visualize the image data (it's a numpy array)
-    # rr.log(f"world/img", rr.Image(image_data))
-    
-    rr.log(
-    f"world/gaze",
-    rr.Points2D(eye_gaze_reprojection_data, radii=20),
-    )
-            
-
-# for obj_id, mesh_vertices in obj_mesh.items():
-#     counts = vertex_hit_counter[obj_id]
-
-#     # 기본 색상 설정
-#     vertex_colors = np.zeros((mesh_vertices.shape[0], 3), dtype=np.uint8) + 255  # 기본 흰색
-
-#     for idx, count in counts.items():
-#         intensity = min(255, count * 20)  # 카운트 기반 색상 (적절히 조정)
-#         vertex_colors[idx] = [255, 255 - intensity, 255 - intensity]  # 빨간색 계열
-
-#     rr.log(
-#         f"world/heatmap/{obj_id}",
-#         rr.Mesh3D(
-#             vertex_positions=mesh_vertices,
-#             triangle_indices=mesh.faces,
-#             vertex_colors=vertex_colors.tolist()
-#         )
-#     )
-            
-rr.log(
-    "world/interact_point_traj", rr.LineStrips3D(traj_list), static=True)
             
             
-# rr.notebook_show()
-rr.save(f" ~/Library/CloudStorage/SynologyDrive-14inch_mac/record/P0001_8d136980.rrd")
+rr.notebook_show()
 
 
