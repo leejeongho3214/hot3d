@@ -125,13 +125,13 @@ obj_pc = torch.tensor(obj_pc)
 
 
 def main():
-    with open(f"{home}/Desktop/hot3d_vis/hand.pkl", "rb") as f:
+    with open(f"{home}/Desktop/hot3d_vis/hand_obj.pkl", "rb") as f:
         item = pickle.load(f)
         l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
         r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
         order = 0
         # for x_lhand, x_rhand, x_obj, text, l_cm, r_cm, gaze_map, obj_cm in item:
-        for x_lhand, x_rhand, x_obj, text, gt_lhand, gt_rhand in item:
+        for x_lhand, x_rhand, x_obj, text, _, _ in item:
             for batch_idx in range(len(x_lhand)):
                 # if ("right" in text[batch_idx] or "Right" in text[batch_idx]):
                 #     hand_vertices, hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
@@ -140,9 +140,6 @@ def main():
                     
                 r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
                 l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, x_lhand[batch_idx])
-                
-                gt_r_hand_vertices, gt_r_hand_faces = process_hand_result(r_hand_layer, gt_rhand[batch_idx])
-                gt_l_hand_vertices, gt_l_hand_faces = process_hand_result(l_hand_layer, gt_lhand[batch_idx])
                 
                 # if "handle" not in text[batch_idx].lower() or "right" not in text[batch_idx].lower():
                 #     continue
@@ -158,41 +155,21 @@ def main():
                     if "right" in text[batch_idx].lower():
                         rr.log(
                             f"world/{order}/r_hand",
-                            rr.Points3D(
-                            positions=r_hand_vertices[frame_idx],
-                            radii=0.005,
-                            colors=[0, 255, 255],)
-                        )
-                        rr.log(
-                            f"world/{order}/r_hand_gt",
-                            rr.Points3D(
-                            positions=gt_r_hand_vertices[frame_idx],
-                            radii=0.005,
-                            colors=[0, 255, 0],
-                        )
+                            rr.Mesh3D(
+                                vertex_positions=r_hand_vertices[frame_idx],
+                                triangle_indices=r_hand_faces,
+                                vertex_normals=r_mesh.vertex_normals,
+                            ),
                         )
                         
                     else:
                         rr.log(
                             f"world/{order}/l_hand",
-                            rr.Points3D(
-                            positions=l_hand_vertices[frame_idx],
-                            radii=0.005,
-                            colors=[0, 255, 255],
-                        )
-                        )
-                        rr.log(
-                            f"world/{order}/l_hand_gt",
-                            rr.Points3D(
-                            positions=gt_l_hand_vertices[frame_idx],
-                            radii=0.005,
-                            colors=[0, 255, 0],
-                        )
-                            # rr.Mesh3D(
-                            #     vertex_positions=gt_l_hand_vertices[frame_idx],
-                            #     triangle_indices=gt_l_hand_faces,
-                            #     vertex_normals=l_mesh.vertex_normals
-                            # ),
+                            rr.Mesh3D(
+                                vertex_positions=l_hand_vertices[frame_idx],
+                                triangle_indices=l_hand_faces,
+                                vertex_normals=l_mesh.vertex_normals
+                            ),
                         )
                                     
                     rr.log(
@@ -200,7 +177,7 @@ def main():
                         rr.Points3D(
                             positions=obj_vertices[frame_idx],
                             radii=0.005,
-                            colors=[255, 255, 255],
+                            colors=[0, 255, 0],
                             labels=[text[batch_idx]]
                         )
                     )
