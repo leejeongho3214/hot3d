@@ -6,6 +6,10 @@ from projectaria_tools.core.sophus import SE3
 from projectaria_tools.utils.rerun_helpers import ToTransform3D
 import trimesh
 
+from scipy.ndimage import gaussian_filter1d
+
+def gaussian_smooth(vertices, sigma=1):
+    return gaussian_filter1d(vertices, sigma=sigma, axis=0)
 
 def log_image(
     image: np.array,
@@ -125,13 +129,13 @@ obj_pc = torch.tensor(obj_pc)
 
 
 def main():
-    with open(f"{home}/Desktop/hot3d_vis/hand_obj.pkl", "rb") as f:
+    with open(f"{home}/Desktop/hot3d_vis/hand_pos.pkl", "rb") as f:
         item = pickle.load(f)
         l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
         r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
         order = 0
         # for x_lhand, x_rhand, x_obj, text, l_cm, r_cm, gaze_map, obj_cm in item:
-        for x_lhand, x_rhand, x_obj, text, _, _, _ in item:
+        for x_lhand, x_rhand, x_obj, text, _, _ in item:
             for batch_idx in range(len(x_lhand)):
                 # if ("right" in text[batch_idx] or "Right" in text[batch_idx]):
                 #     hand_vertices, hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
@@ -148,6 +152,9 @@ def main():
                 l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
                     
                 obj_vertices = process_obj_result(obj_pc, x_obj[batch_idx])
+                
+                l_hand_vertices = gaussian_smooth(l_hand_vertices, sigma=1.0)
+                r_hand_vertices = gaussian_smooth(r_hand_vertices, sigma=1.0)
                 
                 for frame_idx in range(obj_vertices.shape[0]):
                     rr.set_time_sequence("frame", frame_idx)
