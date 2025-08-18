@@ -1,223 +1,158 @@
 
-import json
 import rerun as rr
-import numpy as np
-
 import torch
 
 import os
 
 from utils import *
-from data_loaders.mano_layer import MANOHandModel
 
 from mano import build_mano_aa
 import trimesh
 
-home = os.path.expanduser("~")
+from function import object_vis, data_load, contact_gaze, angle_calcu, hand_gaze_calcu
 
-with open(os.path.join(home, "Desktop/instance.json"), "r") as f:
-    instance_ = json.load(f)
-
-with np.load(home + "/Desktop/mug_white.npz", allow_pickle=True) as data:
-    object_idx = data["object_idx"]
-    x_lhand = data["x_lhand"]
-    x_rhand = data["x_rhand"]
-    x_obj = data["x_obj"]
-    lhand_org = data["lhand_org"]
-    rhand_org = data["rhand_org"]
-    lcf_idx = data["lcf_idx"] # left hand contact frame idx
-    lcov_idx = data["lcov_idx"] # left contact object verts idx
-    lchj_idx = data["lchj_idx"] # left contact hand joints idx
-    ldist_value = data["ldist_value"]
-    rcf_idx = data["rcf_idx"] # right hand contact frame idx
-    rcov_idx = data["rcov_idx"] # right contact object verts idx
-    rchj_idx = data["rchj_idx"] # right contact hand joints idx
-    rdist_value = data["rdist_value"]
-    is_lhand = data["is_lhand"]
-    is_rhand = data["is_rhand"]
-    action_id = data["action"]
-    action_name = data["action_name"]
-    nframes = data["nframes"]
-    gaze_map = data["gaze_map"]
-    gaze = data["gaze"]
-    cam_pose = data["cam_pose"]
-    
     
 def main():
-    # rr.init("aa", spawn=True)
+    home = os.path.expanduser("~")
+    instance_, object_idx, x_lhand, x_rhand, x_obj, lcov_idx, rcf_idx, rcov_idx, is_lhand, is_rhand, action_name, gaze_map, gaze, cam_pose = data_load()
 
-    # for instance_id in instance_.keys():
-    #     if instance_[instance_id]['instance_name'] not in object_model.object_name or instance_[instance_id]['instance_name'] in ["cellphone", "potato_masher"]:
-    #         continue
-        
-    #     _, obj_pc, _, _ = object_model(instance_[instance_id]['instance_name'])
-        
-    #     rr.log(
-    #             f"world/objects/{instance_[instance_id]['instance_name']}",
-    #             rr.Asset3D(
-    #                 path=os.path.join(home, f"Desktop/assets/{instance_id}.glb"),
-    #             ),
-    #         )
-        
-        # rr.log(
-        #     f"world/{instance_[instance_id]['instance_name']}",
-        #     rr.Points3D(
-        #         positions=obj_pc ,
-        #         radii=0.005,
-        #     ))
-        
-    object_model = ObjectModel(os.path.join(home, "Desktop/obj.pkl"))
+    object_model = ObjectModel(os.path.join(home, "Desktop/hot3d_vis/obj.pkl"))
     _, obj_pc, _, _ = object_model(instance_[str(int(object_idx[0]))]['instance_name'])
-    cov = []
-    for idx in range(len(rcf_idx)):
-        lcov_map = get_contact_map(lcov_idx[idx], 1024, is_lhand[idx])
-        rcov_map = get_contact_map(rcov_idx[idx], 1024, is_rhand[idx])
-        cov_map = (lcov_map+rcov_map)>0
-        cov_map = cov_map.astype(np.float32)
-        cov.append(torch.tensor(cov_map))
 
     vertz = []
-    [vertz.append(process_obj_result(torch.tensor(obj_pc), torch.tensor(x_obj[i]))) for i in range(len(x_obj))]
+    for i in range(len(x_obj)):
+        vertz.append(process_obj_result(torch.tensor(obj_pc), torch.tensor(x_obj[i])))
     post_obj_pc = torch.stack(vertz)
 
-    '''
-    기존 Gaze를 camera coordinate -> world coordinate로 변환
-    '''
-    gaze = torch.stack(list(gaze)).squeeze(-1)
-    gaze = torch.cat([gaze, torch.ones([gaze.shape[0], gaze.shape[1], gaze.shape[2],  1])], dim = -1)
-    cam_pose = torch.tensor(cam_pose)
-
-    gaze_origin_cam = torch.einsum('bfij,bfpj->bfpi', cam_pose, gaze[:, :, 0:1, :])  # (B, F, P, 4)
-    gaze_origin_cam = gaze_origin_cam[..., :3]  # (B, F, P, 3)
-
-    R = cam_pose[..., :3, :3]  # 회전 행렬만 추출
-    gaze_dir_cam = torch.einsum('bfij,bfpj->bfpi', R, gaze[:, :, 1:2, :-1])  # (B, F, P, 3)
-            
-    gaz = torch.zeros([len(gaze_map), 1024])
-    for i, idx in enumerate(gaze_map):
-        gaz[i][idx] = 1 
+    contact_map, gaze_map, gaze_origin_cam, gaze_dir_cam = contact_gaze(rcf_idx, rcov_idx, lcov_idx, is_lhand, is_rhand, gaze_map, gaze, cam_pose)
 
     l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
     r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
 
-    joints = []
-    wanted_grip = [idx for idx, text in enumerate(action_name) if ("Hook" in text) and ("right" in text)]
-    angle = []
-    for idx, i in enumerate(wanted_grip):
-        r_hand_vertices, r_hand_faces, r_hand_joints = process_hand_result(r_hand_layer, torch.tensor(x_rhand[i]))
-        l_hand_vertices, l_hand_faces, l_hand_joints = process_hand_result(l_hand_layer, torch.tensor(x_lhand[i]))
+    wanted_grip = [idx for idx, text in enumerate(action_name) if ("handle" in text.lower()) and ("right" in text.lower())]
+    
+    angle = angle_calcu(wanted_grip, x_obj, gaze_map, gaze_origin_cam, post_obj_pc)
+    sorted_angle = sorted(angle, key = lambda x: x[-1])
+    
+    for idx, (ang_idx, obj_gaze_angle, origin, vector, gaze_angle) in enumerate(sorted_angle):
+        rr.set_time_sequence("frame", 0)
+        i = wanted_grip[ang_idx]
+        
+        r_hand_vertices, r_hand_faces, r_hand_joints, r_hand_param = process_hand_result(r_hand_layer, torch.tensor(x_rhand[i]))
+        l_hand_vertices, l_hand_faces, l_hand_joints, l_hand_param = process_hand_result(l_hand_layer, torch.tensor(x_lhand[i]))
         lmesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
         rmesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
         
-        if "right" in action_name[i]:
-            joints.append(r_hand_joints)
-        else:
-            joints.append(l_hand_joints)
-        
         obj_rotmat = rot6d_to_rotmat(torch.tensor(x_obj[i][:, 3:])).reshape(-1, 3, 3)
+        world_obj_rotmat = torch.einsum('fij,fpj->fpi', torch.tensor(cam_pose[i][:, :3, :3]).to(torch.float), obj_rotmat[:, :3, :3].to(torch.float))  # (B, F, P, 4)
         
-        if len(gaze_map[i]) == 0: continue
+        # rr.log(
+        #         f"world/{idx}/gaze_lists",
+        #         rr.Arrows3D(
+        #             origins=[origin.tolist()],      
+        #             vectors=[vector.tolist()],
+        #             radii=0.002,
+        #             colors=[[255, 0, 0]],
+        #             labels=["Projected Gaze (XZ-plane)"]
+        #         )
+        #     )
         
-        obj_rotmat = torch.mean(obj_rotmat[:30], dim = 0)
-        
-        gaze_vec = torch.mean(post_obj_pc[i, :30][:, gaze_map[i]], dim = (0, 1)) -  torch.mean(gaze_origin_cam[i, :30].squeeze(), dim = (0, 1))
-        obj_vec  = obj_rotmat[:, 0]
+        # hand_gaze_calcu(rr, r_hand_vertices, r_hand_faces, rmesh, r_hand_joints, gaze_origin_cam, post_obj_pc, gaze_map, i)
 
-        # 2. 정규화
-        gaze_vec = F.normalize(gaze_vec, dim=0).to(torch.float64)
-        obj_vec = F.normalize(obj_vec, dim=0).to(torch.float64)
-
-        # 3. 코사인 유사도
-        cos_sim = torch.dot(gaze_vec, obj_vec).clamp(-1.0, 1.0)
-
-        # 4. 각도 계산 (라디안 → 도)
-        angle_rad = torch.acos(cos_sim)
-        angle_deg = torch.rad2deg(angle_rad)
-
-        angle.append([idx, angle_deg.item()])
-        
-    angle = sorted(angle, key = lambda x: x[1])
-    for z, (idx, an) in enumerate(angle):
-        i = wanted_grip[idx]
-        r_hand_vertices, r_hand_faces, r_hand_joints = process_hand_result(r_hand_layer, torch.tensor(x_rhand[i]))
-        l_hand_vertices, l_hand_faces, l_hand_joints = process_hand_result(l_hand_layer, torch.tensor(x_lhand[i]))
-        lmesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
-        rmesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
-        
-        if "right" in action_name[i]:
-            joints.append(r_hand_joints)
-        else:
-            joints.append(l_hand_joints)
-        
-        obj_rotmat = rot6d_to_rotmat(torch.tensor(x_obj[i][:, 3:])).reshape(-1, 3, 3)
-        obj_quat = matrix_to_quaternion(obj_rotmat)
-        
-        colors = np.zeros_like(obj_pc, dtype=np.uint8) # (N, 3)
-        colors[cov[i] == 1] = [255, 0, 0]
-        colors[cov[i] == 0] = [0, 0, 255]
-
-        rr.log(
-            f"world/{z}/cov",
-            rr.Points3D(
-                positions=obj_pc,
-                radii=0.005,
-                colors=colors,
-            ))
-        
-        colors = np.zeros_like(obj_pc, dtype=np.uint8) # (N, 3)
-        colors[gaz[i] == 1] = [255, 255, 0]
-        colors[gaz[i] == 0] = [0, 0, 255]
-
-        rr.log(
-            f"world/{z}/gaze_map",
-            rr.Points3D(
-                positions=obj_pc + [0.2, 0, 0],
-                radii=0.005,
-                colors=colors,
-            ))
-
-        for f in range(len(gaze[0])):
+        for f in range(60):
             rr.set_time_sequence("frame", f)
 
             g_origin = torch.mean(gaze_origin_cam[i, :30].squeeze(), dim = (0))
-            g_vec = torch.mean(post_obj_pc[i, :30][:, gaze_map[i]], dim = (0, 1)) -  torch.mean(gaze_origin_cam[i, :30].squeeze(), dim = (0))
+            g_vec = torch.mean(post_obj_pc[i, :30][:, gaze_map[i][-1].to(torch.bool)], dim = (0, 1)) -  torch.mean(gaze_origin_cam[i, :30].squeeze(), dim = (0))
             
-            rr.log(f"world/{z}/gaze", rr.Arrows3D(origins=[g_origin], vectors=[g_vec], colors= [[255, 255, 0]]))
-            # rr.log(f"world/{z}/ori_gaze", rr.Arrows3D(origins=[gaze_origin_cam[i][f][0][:3]], vectors=[gaze_dir_cam[i][f][0][:3]], colors= [[255, 0, 255]]))
+            rr.log(f"world/{idx}/gaze", rr.Arrows3D(origins=[g_origin], vectors=[g_vec], colors= [[255, 255, 0]], labels=["gaze_vector"]))
+            rr.log(f"world/{idx}/ori_gaze", rr.Arrows3D(origins=[gaze_origin_cam[i][f][0][:3]], vectors=[gaze_dir_cam[i][f][0][:3]], colors= [[255, 0, 255]], labels=["gaze_map"]))
             
             rr.log(
-                f"world/{z}/gaze_point",
+                f"world/{idx}/gaze_point",
                 rr.Points3D(
                     positions=[gaze_origin_cam[i][f][0][:3]],
                     colors=[[255, 255, 0]],
-                    labels=[an]
+                    labels=[gaze_angle]
                 )
             )
             
-            rr.log(f"world/{z}/obj_vec",
-                rr.Arrows3D(
-                    origins=[x_obj[i][f][:3]],
-                    vectors=[F.normalize(obj_vec, dim=0)],
-                    colors= [[0, 255, 255]]
-        ))
+            # rr.log(f"world/{idx}/obj_vec",
+            #     rr.Arrows3D(
+            #         origins=torch.mean(post_obj_pc[i][f], dim = 0),
+            #         vectors=obj_rotmat[f, 0],
+            #         colors= [[0, 255, 0], [0, 0, 255]],
+            #         labels=["obj_rot_x"]
+            # ))
+                        
+            # rr.log(f"worldy/{idx}",
+            #     rr.Arrows3D(
+            #         # origins=post_obj_pc[i][f],
+            #         origins=[[0, 0, 0]],
+            #         vectors=obj_rotmat[f, 1],
+            #         colors= [[0, 255, 0]],
+            #         labels=[ "y_vec"]
+            # ))
+            
+            # rr.log(f"worldz/{idx}",
+            #     rr.Arrows3D(
+            #         # origins=post_obj_pc[i][f],
+            #         origins=[[0, 0, 0]],
+            #         vectors=obj_rotmat[f, 2],
+            #         colors= [[0, 0, 255]],
+            #         labels=["z_vec"]
+            # ))
             
             rr.log(
-            f"world/{z}/obj",
-            rr.Points3D(
-                positions=post_obj_pc[i][f],
-                radii=0.005,
-                colors= [0, 0, 255]
+                f"world/{idx}/obj",
+                rr.Points3D(
+                    positions=post_obj_pc[i][f],
+                    radii=0.005,
+                    colors= [0, 0, 255]
             ))
             
+
+            # rr.log(f"world/{idx}/rotation", rr.Arrows3D(
+            #     origins=torch.mean(post_obj_pc[i][f], dim = 0).unsqueeze(0).repeat(3, 1),
+            #     vectors=(obj_rotmat[f] @ torch.eye(3)).T.tolist(), 
+            #     colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            #     labels=["x'", "y'", "z'"]
+            # ))
+                        
             rr.log(
-            f"world/{z}/rhand",
+            f"world/{idx}/rhand",
                 rr.Mesh3D(
                     vertex_positions=r_hand_vertices[f],
                     triangle_indices=r_hand_faces,
                     vertex_normals=rmesh.vertex_normals
                 ),)
+            
+            # if f < 30:
+            #     colors = np.zeros_like(obj_pc, dtype=np.uint8)
+            #     colors[gaze_map[i][f] == 1] = [255, 255, 0]
+            #     colors[gaze_map[i][f] == 0] = [0, 0, 255]
+
+            #     rr.log(
+            #         f"world/{idx}/gaze_map",
+            #         rr.Points3D(
+            #             positions=post_obj_pc[i][f],
+            #             radii=0.005,
+            #             colors=colors,
+            #         ))
+                
+            colors = np.zeros_like(obj_pc, dtype=np.uint8)
+            colors[contact_map[i] == 1] = [255, 0, 0]
+            colors[contact_map[i] == 0] = [0, 0, 255]
+                    
+            rr.log(
+                f"world/{idx}/contact_map",
+                rr.Points3D(
+                    positions=post_obj_pc[i][f] + torch.tensor([0.4, 0, 0]),
+                    radii=0.005,
+                    colors=colors,
+                ))
 
     rr.notebook_show()
 
-if __name__ == main():
+if __name__ == "__main__":
     main()

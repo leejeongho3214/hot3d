@@ -68,7 +68,7 @@ class ObjectModel:
 
             
 home = os.path.expanduser("~")
-mano_hand_model_path = os.path.join(home, "Desktop/mano_v1_2/models")
+mano_hand_model_path = os.path.join(home, "Desktop/hot3d_vis/mano_v1_2/models")
 mano_hand_model = None
 if mano_hand_model_path is not None:
     mano_hand_model = MANOHandModel(mano_hand_model_path)
@@ -116,21 +116,22 @@ def rigid_transform(A, B):
     t = centroid_B - R @ centroid_A
     return R, t
 
-with open(os.path.join(home, "Desktop/instance.json"), "r") as f:
+with open(os.path.join(home, "Desktop/hot3d_vis/instance.json"), "r") as f:
     instance_ = json.load(f)
     
-object_model = ObjectModel(os.path.join(home, "Desktop/obj.pkl"))
-_, obj_pc, _, _ = object_model("mug_patterned")
+object_model = ObjectModel(os.path.join(home, "Desktop/hot3d_vis/obj.pkl"))
+_, obj_pc, _, _ = object_model("mug_white")
 obj_pc = torch.tensor(obj_pc)
 
 
 def main():
-    with open(f"{home}/Desktop/q.pkl", "rb") as f:
+    with open(f"{home}/Desktop/hot3d_vis/hand.pkl", "rb") as f:
         item = pickle.load(f)
         l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
         r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
         order = 0
-        for x_lhand, x_rhand, x_obj, text in item:
+        # for x_lhand, x_rhand, x_obj, text, l_cm, r_cm, gaze_map, obj_cm in item:
+        for x_lhand, x_rhand, x_obj, text, gt_lhand, gt_rhand in item:
             for batch_idx in range(len(x_lhand)):
                 # if ("right" in text[batch_idx] or "Right" in text[batch_idx]):
                 #     hand_vertices, hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
@@ -140,7 +141,12 @@ def main():
                 r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
                 l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, x_lhand[batch_idx])
                 
-                # mesh = trimesh.Trimesh(vertices=hand_vertices[0], faces=hand_faces, process=False)
+                gt_r_hand_vertices, gt_r_hand_faces = process_hand_result(r_hand_layer, gt_rhand[batch_idx])
+                gt_l_hand_vertices, gt_l_hand_faces = process_hand_result(l_hand_layer, gt_lhand[batch_idx])
+                
+                # if "handle" not in text[batch_idx].lower() or "right" not in text[batch_idx].lower():
+                #     continue
+                
                 r_mesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
                 l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
                     
@@ -148,39 +154,108 @@ def main():
                 
                 for frame_idx in range(obj_vertices.shape[0]):
                     rr.set_time_sequence("frame", frame_idx)
-                    rr.log(
-                        f"world/r_hand/{order}",
-                        rr.Mesh3D(
-                            vertex_positions=r_hand_vertices[frame_idx],
-                            triangle_indices=r_hand_faces,
-                            vertex_normals=r_mesh.vertex_normals
-                        ),
-                    )
                     
-                    rr.log(
-                        f"world/l_hand/{order}",
-                        rr.Mesh3D(
-                            vertex_positions=l_hand_vertices[frame_idx],
-                            triangle_indices=l_hand_faces,
-                            vertex_normals=l_mesh.vertex_normals
-                        ),
-                    )
+                    if "right" in text[batch_idx].lower():
+                        rr.log(
+                            f"world/{order}/r_hand",
+                            rr.Points3D(
+                            positions=r_hand_vertices[frame_idx],
+                            radii=0.005,
+                            colors=[0, 255, 255],)
+                        )
+                        rr.log(
+                            f"world/{order}/r_hand_gt",
+                            rr.Points3D(
+                            positions=gt_r_hand_vertices[frame_idx],
+                            radii=0.005,
+                            colors=[0, 255, 0],
+                        )
+                        )
+                        
+                    else:
+                        rr.log(
+                            f"world/{order}/l_hand",
+                            rr.Points3D(
+                            positions=l_hand_vertices[frame_idx],
+                            radii=0.005,
+                            colors=[0, 255, 255],
+                        )
+                        )
+                        rr.log(
+                            f"world/{order}/l_hand_gt",
+                            rr.Points3D(
+                            positions=gt_l_hand_vertices[frame_idx],
+                            radii=0.005,
+                            colors=[0, 255, 0],
+                        )
+                            # rr.Mesh3D(
+                            #     vertex_positions=gt_l_hand_vertices[frame_idx],
+                            #     triangle_indices=gt_l_hand_faces,
+                            #     vertex_normals=l_mesh.vertex_normals
+                            # ),
+                        )
                                     
                     rr.log(
-                        f"world/object/{order}",
+                        f"world/{order}/object",
                         rr.Points3D(
                             positions=obj_vertices[frame_idx],
                             radii=0.005,
-                            colors=[0, 255, 0],
+                            colors=[255, 255, 255],
                             labels=[text[batch_idx]]
                         )
                     )
                 order += 1
-                
-                # if order == 10:
-                #     return 
 
 
 if __name__ == main():
     main()
     rr.notebook_show()
+    
+    
+    
+    
+    
+                        # # 선택된 contact points
+                    # pos_contact = r_hand_vertices[frame_idx][r_cm[batch_idx][frame_idx].bool()]
+                    # color_contact = torch.tensor([[255, 255, 0]] * pos_contact.shape[0])
+
+                    # # 선택되지 않은 points
+                    # pos_non_contact = r_hand_vertices[frame_idx][~r_cm[batch_idx][frame_idx].bool()]
+                    # color_non_contact = torch.tensor([[0, 255, 255]] * pos_non_contact.shape[0])
+
+                    # # 합치기
+                    # positions = torch.cat([pos_contact, pos_non_contact], dim=0)
+                    # colors = torch.cat([color_contact, color_non_contact], dim=0)
+                    
+                    # if color_contact.sum() == 0:
+                    #     colors = [0, 255, 255]
+
+                    # rr.log(
+                    #     f"world/{order}/r_hand_cm",
+                    #     rr.Points3D(
+                    #         positions=positions,
+                    #         radii=0.005,
+                    #         colors=colors
+                    #     )
+                    #     )
+                    
+                    # pos_contact = obj_vertices[frame_idx][obj_cm[batch_idx][frame_idx].bool()]
+                    # color_contact = torch.tensor([[255, 0, 255]] * pos_contact.shape[0])
+
+                    # pos_non_contact = obj_vertices[frame_idx][~obj_cm[batch_idx][frame_idx].bool()]
+                    # color_non_contact = torch.tensor([[0, 0, 255]] * pos_non_contact.shape[0])
+                    
+                    # positions = torch.cat([pos_contact, pos_non_contact], dim=0)
+                    # colors = torch.cat([color_contact, color_non_contact], dim=0)
+                    
+                    # if pos_contact.sum() == 0:
+                    #     colors = [0, 0, 255]                        
+                    
+                    # rr.log(
+                    #     f"world/{order}/obj_cm",
+                    #     rr.Points3D(
+                    #         positions=positions,
+                    #         radii=0.005,
+                    #         colors=colors,
+                    #     )
+                    #     )

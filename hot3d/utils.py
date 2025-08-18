@@ -26,6 +26,9 @@ class ObjectModel:
                 self.obj_pc_top = None
 
     def __call__(self, object_name):
+        if object_name not in list(self.obj_pcs.keys()):
+            return None
+        
         if isinstance(object_name, int):
             object_name = self.object_name[object_name]
         point_set = self.point_sets[object_name].copy()
@@ -190,7 +193,8 @@ def process_hand_result(hand_layer, hand_params):
     hand_faces = hand_layer.faces.copy().astype(np.int16)
     hand_faces = torch.LongTensor(hand_faces)
     hand_joints = out.joints + hand_trans
-    return hand_vertices, hand_faces, hand_joints
+    return hand_vertices, hand_faces, hand_joints, hand_pose
+    # return out.vertices, hand_faces, hand_joints, hand_pose
  
 def process_obj_result(obj_verts, obj_params):
     obj_trans = obj_params[:, :3]
@@ -199,6 +203,7 @@ def process_obj_result(obj_verts, obj_params):
     obj_pc_rotated = torch.einsum("tij,kj->tki", obj_rotmat, obj_verts)
     obj_verts_transformed = obj_pc_rotated + obj_trans.unsqueeze(1)
     return obj_verts_transformed
+    # return obj_pc_rotated
     
 rr.init("Input Data", spawn= True)   
 
