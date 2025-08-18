@@ -131,7 +131,7 @@ def main():
         r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
         order = 0
         # for x_lhand, x_rhand, x_obj, text, l_cm, r_cm, gaze_map, obj_cm in item:
-        for x_lhand, x_rhand, x_obj, text, _, _ in item:
+        for x_lhand, x_rhand, x_obj, text, _, _, _ in item:
             for batch_idx in range(len(x_lhand)):
                 # if ("right" in text[batch_idx] or "Right" in text[batch_idx]):
                 #     hand_vertices, hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
