@@ -1,6 +1,10 @@
 import os
 
 import cv2
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
 from dataset_api import Hot3dDataProvider
 from data_loaders.loader_object_library import load_object_library
 from data_loaders.mano_layer import MANOHandModel
@@ -13,7 +17,7 @@ import numpy as np
 from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions
 from projectaria_tools.core.sophus import SE3
 from projectaria_tools.utils.rerun_helpers import ToTransform3D
-import matplotlib.pyplot as plt
+
 def log_image(
     image: np.array,
     label: str,
@@ -44,10 +48,10 @@ def direction_to_equirectangular_uv(direction, pano_width, pano_height):
     return u % pano_width, np.clip(v, 0, pano_height - 1)
     
 home = os.path.expanduser("~")
-hot3d_dataset_path = home + "/Desktop"
-sequence_path = os.path.join(hot3d_dataset_path, "dataset/P0001_4bf4e21a")
+hot3d_dataset_path = home + "/Desktop/hot3d_vis"
+sequence_path = os.path.join(hot3d_dataset_path, "P0001_4bf4e21a")
 object_library_path = os.path.join(hot3d_dataset_path, "assets")
-mano_hand_model_path = os.path.join(home, "Desktop/mano_v1_2/models")
+mano_hand_model_path = os.path.join(home, "Desktop/hot3d_vis/mano_v1_2/models")
 
 if not os.path.exists(sequence_path) or not os.path.exists(object_library_path):
     print("Invalid input sequence or library path.")
@@ -145,24 +149,3 @@ if status == cv2.Stitcher_OK:
 else:
     print("파노라마 생성 실패. 상태 코드:", status)
 
-#     h, w = image_np.shape[:2]
-#     for v in range(0, h, 10):
-#         for u in range(0, w, 10):
-#             ray = pixel_to_ray(u, v, intrinsics)
-#             direction_world = T_wc_mat[:3, :3] @ ray
-#             u_pano, v_pano = direction_to_equirectangular_uv(direction_world, pano_width, pano_height)
-#             color = image_np[v, u]
-
-#             if pano_mask[v_pano, u_pano] == 0:
-#                 pano_image[v_pano, u_pano] = color
-#                 pano_mask[v_pano, u_pano] = 1
-#             else:
-#                 pano_image[v_pano, u_pano] = (
-#                     pano_image[v_pano, u_pano].astype(np.float32) * 0.5 + color * 0.5
-#                 ).astype(np.uint8)
-
-# plt.figure(figsize=(12, 6))
-# plt.imshow(pano_image)
-# plt.title("Panorama from HOT3D frames")
-# plt.axis("off")
-# plt.show()

@@ -97,7 +97,7 @@ def angle_calcu(wanted_grip, x_obj, gaze_map, gaze_origin_cam, post_obj_pc):
 
         origin = (torch.mean(gaze_origin_cam[i, :30].squeeze(), dim = (0))).to(torch.float64)
         
-        plane_normal = torch.cross(x_axis_rot, z_axis_rot)  # 또는 y_axis_rot
+        plane_normal = torch.cross(x_axis_rot, z_axis_rot, dim=0)  # 또는 y_axis_rot
         plane_normal = (plane_normal / plane_normal.norm()).to(torch.float64)
         
         p0 = origin  # shape: (3,)

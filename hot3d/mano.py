@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from smplx import MANO
 import torch
@@ -7,22 +8,21 @@ from easydict import EasyDict as edict
 from dataclasses import dataclass, fields
 from typing import NewType, Optional
 
+# home = os.path.expanduser("~")
+# mano_hand_model_path = os.path.join(home, "Desktop/hot3d_vis/mano_v1_2/models")
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return edict(config)
 
-
 config = load_config("mano.yaml")
 mano_config = config.mano
-MODEL_DIR = mano_config.root
+MODEL_DIR =  os.path.join(os.path.expanduser("~"), "Desktop/hot3d_vis/mano_v1_2/models")
 SKELETONS = mano_config.skeletons
 SKELETONS_W_TIP = mano_config.skeletons_w_tip
 # left_hand_mean = mano_config.left_hand_mean
 # right_hand_mean = mano_config.right_hand_mean
-
-
 
 Tensor = NewType('Tensor', torch.Tensor)
 

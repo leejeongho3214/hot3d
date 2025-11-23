@@ -1,12 +1,24 @@
+import argparse
 import json
-import rerun as rr
+import inspect
+import re
+from typing import Optional
+if not hasattr(inspect, "getargspec"):
+    # Compatibility for chumpy on Python 3.11+
+    inspect.getargspec = inspect.getfullargspec  # type: ignore[attr-defined]
 import numpy as np
+# NumPy 1.24+ compatibility for legacy packages (e.g., chumpy)
+for _name, _type in [("bool", bool), ("int", int), ("float", float), ("object", object), ("str", str)]:
+    # Use __dict__ to avoid triggering NumPy deprecation warnings during attribute access
+    if _name not in np.__dict__:
+        setattr(np, _name, _type)
 
 from projectaria_tools.core.sophus import SE3
 from projectaria_tools.utils.rerun_helpers import ToTransform3D
 import trimesh
 
 from scipy.ndimage import gaussian_filter1d
+from collections import defaultdict
 
 def gaussian_smooth(vertices, sigma=1):
     return gaussian_filter1d(vertices, sigma=sigma, axis=0)
@@ -29,6 +41,10 @@ def log_pose(
 import os
 import torch
 import numpy as np
+
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 from rot import *
 
 import rerun as rr
@@ -68,8 +84,6 @@ class ObjectModel:
         else:
             return point_set, obj_pc, obj_pc_normal, obj_path
 
-
-
             
 home = os.path.expanduser("~")
 mano_hand_model_path = os.path.join(home, "Desktop/hot3d_vis/mano_v1_2/models")
@@ -101,8 +115,6 @@ def process_obj_result(obj_verts, obj_params):
     obj_verts_transformed = obj_pc_rotated + obj_trans.unsqueeze(1)
     return obj_verts_transformed
     
-rr.init("Input Data", spawn= True)   
-
 def rigid_transform(A, B):
     """두 포인트 클라우드 A, B (N,3) numpy array에 대해, B로 정렬하는 R, t 반환"""
     centroid_A = A.mean(axis=0)
@@ -120,47 +132,141 @@ def rigid_transform(A, B):
     t = centroid_B - R @ centroid_A
     return R, t
 
+
+_PART_KEYWORDS = [
+    "handle",
+    "rim",
+    "body",
+    "top",
+    "bottom",
+    "side",
+    "edge",
+    "surface",
+    "base",
+    "cover",
+    "cap",
+    "lid",
+    "lip",
+    "tip",
+    "front",
+    "back",
+    "middle",
+    "center",
+]
+
+
+def _extract_part_keyword(text: str) -> Optional[str]:
+    for keyword in _PART_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            return keyword
+    return None
+
+
+def _normalize_action_key(text: str) -> str:
+    """Return a grouping key that ignores hand laterality and keeps object part names."""
+    lowered = re.sub(r"\s+", " ", text.lower()).strip(" .")
+    if not lowered:
+        return ""
+    base, sep, _ = lowered.partition(" with ")
+    if not base:
+        base = lowered
+    base = re.sub(r"\b(right|left|hands?|hand)\b", "", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    if not base:
+        base = lowered
+    if " of " in base:
+        before_of, obj = base.split(" of ", 1)
+        part_keyword = _extract_part_keyword(before_of)
+        if not part_keyword:
+            part_keyword = _extract_part_keyword(lowered)
+        if part_keyword and part_keyword not in before_of:
+            verb = before_of.split()[0] if before_of.split() else before_of
+            base = f"{verb} {part_keyword} of {obj}"
+    if base:
+        return base
+    cleaned = re.sub(r"\b(right|left|hands?|hand)\b", "", lowered)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else lowered
+
+
+def _slugify_action_key(text: str) -> str:
+    """Convert the normalized action description into an id-safe slug."""
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Visualize HOT3D predictions in Rerun.")
+    parser.add_argument(
+        "--recording-name",
+        default=None,
+        help="Optional name for the Rerun recording (defaults to the auto-generated timestamp).",
+    )
+    return parser.parse_args()
+
 with open(os.path.join(home, "Desktop/hot3d_vis/instance.json"), "r") as f:
     instance_ = json.load(f)
     
 object_model = ObjectModel(os.path.join(home, "Desktop/hot3d_vis/obj.pkl"))
-_, obj_pc, _, _ = object_model("mug_white")
-obj_pc = torch.tensor(obj_pc)
+obj_pc = dict()
+
+for obj_name in object_model.obj_pcs.keys():
+    _, pc, _, _ = object_model(obj_name)
+    obj_pc[obj_name] = torch.tensor(pc)
 
 
 def main():
-    with open(f"{home}/Desktop/hot3d_vis/hand_obj.pkl", "rb") as f:
+    file_name = "text2hoi_gaze"
+    recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
+    rr.init("Input Data", spawn=True)
+    
+    with open(recoding_name, "rb") as f:
         item = pickle.load(f)
         l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
         r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
-        order = 0
-        # for x_lhand, x_rhand, x_obj, text, l_cm, r_cm, gaze_map, obj_cm in item:
-        for x_lhand, x_rhand, x_obj, text, gt_lhand, gt_rhand, gt_obj in item:
+        action_to_index = dict()
+        action_to_slug = dict()
+        action_to_sample_counts = defaultdict(int)
+        for x_lhand, x_rhand, x_obj, text, gt_lhand, gt_rhand, gt_obj, gaze_map in item:
             for batch_idx in range(len(x_lhand)):
-                # if ("right" in text[batch_idx] or "Right" in text[batch_idx]):
-                #     hand_vertices, hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
-                # else:
-                #     hand_vertices, hand_faces = process_hand_result(l_hand_layer, x_lhand[batch_idx])
-                    
+                text_entry = text[batch_idx]
+                action_key = _normalize_action_key(text_entry)
+                if action_key not in action_to_index:
+                    action_index = len(action_to_index)
+                    action_to_index[action_key] = action_index
+                    slug = _slugify_action_key(action_key)
+                    action_to_slug[action_key] = slug if slug else "action"
+                action_index = action_to_index[action_key]
+                action_slug = action_to_slug[action_key]
+                base_path = f"{file_name}/{action_index}_{action_slug}"
+                hand_path = "r_hand" if "right" in text_entry.lower() else "l_hand"
+                sample_idx = action_to_sample_counts[action_key]
+                action_to_sample_counts[action_key] += 1
+                sample_path = f"{base_path}/sample_{sample_idx:03d}"
+
                 r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, x_rhand[batch_idx])
                 l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, x_lhand[batch_idx])
+                obj_vertices = process_obj_result(obj_pc[text_entry.split("of ")[-1].split(' with')[0].lower()], x_obj[batch_idx])
                 
-                # if "handle" not in text[batch_idx].lower() or "right" not in text[batch_idx].lower():
-                #     continue
+                # r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, gt_rhand[batch_idx])
+                # l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, gt_lhand[batch_idx])
+                # obj_vertices = process_obj_result(obj_pc[text[batch_idx].split("of ")[-1].split(' with')[0].lower()], gt_obj[batch_idx])
+                
+                # l_hand_vertices = gaussian_smooth(l_hand_vertices, sigma=3)
+                # r_hand_vertices = gaussian_smooth(r_hand_vertices, sigma=3)
+                # obj_vertices = gaussian_smooth(obj_vertices, sigma=3)
                 
                 r_mesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
                 l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
-                    
-                obj_vertices = process_obj_result(obj_pc, x_obj[batch_idx])
-                
 
                 
                 for frame_idx in range(obj_vertices.shape[0]):
+                    rr.set_time_sequence("sample", sample_idx)
                     rr.set_time_sequence("frame", frame_idx)
                     
-                    if "right" in text[batch_idx].lower():
+                    if "right" in text_entry.lower():
                         rr.log(
-                            f"world/{order}/r_hand",
+                            f"{sample_path}/{hand_path}",
                             rr.Mesh3D(
                                 vertex_positions=r_hand_vertices[frame_idx],
                                 triangle_indices=r_hand_faces,
@@ -170,7 +276,7 @@ def main():
                         
                     else:
                         rr.log(
-                            f"world/{order}/l_hand",
+                            f"{sample_path}/{hand_path}",
                             rr.Mesh3D(
                                 vertex_positions=l_hand_vertices[frame_idx],
                                 triangle_indices=l_hand_faces,
@@ -179,20 +285,63 @@ def main():
                         )
                                     
                     rr.log(
-                        f"world/{order}/object",
+                        f"{sample_path}/object/{hand_path}",
                         rr.Points3D(
                             positions=obj_vertices[frame_idx],
                             radii=0.005,
                             colors=[0, 255, 0],
-                            labels=[text[batch_idx]]
+                            labels=[text_entry]
                         )
                     )
-                order += 1
+                    
+                    
+                    # if gaze_map[batch_idx][frame_idx].sum() != 0 or frame_idx == 0:
+                    #     colors = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
+                    #     colors[gaze_map[batch_idx][frame_idx] == 1] = [255, 255, 0]
+                    #     colors[gaze_map[batch_idx][frame_idx] == 0] = [0, 0, 255]
+                        
+                    # rr.log(
+                    #     f"world/{order}/gaze_map",
+                    #     rr.Points3D(
+                    #         positions=obj_vertices[frame_idx],
+                    #         radii=0.005,
+                    #         colors=colors,
+                    #         labels=[text[batch_idx]]
+                    #     ))
+                    
+                    # if "right" in text[batch_idx].lower():
+                    #     rr.log(
+                    #         f"world/{order}/r_hand",
+                    #         rr.Mesh3D(
+                    #             vertex_positions=r_hand_vertices[frame_idx],
+                    #             triangle_indices=r_hand_faces,
+                    #             vertex_normals=r_mesh.vertex_normals,
+                    #         ),
+                    #     )
+                        
+                    # else:
+                    #     rr.log(
+                    #         f"world/{order}/l_hand",
+                    #         rr.Mesh3D(
+                    #             vertex_positions=l_hand_vertices[frame_idx],
+                    #             triangle_indices=l_hand_faces,
+                    #             vertex_normals=l_mesh.vertex_normals
+                    #         ),
+                    #     )
+                                    
+                    # rr.log(
+                    #     f"world/{order}/object",
+                    #     rr.Points3D(
+                    #         positions=obj_vertices[frame_idx],
+                    #         radii=0.005,
+                    #         colors=[0, 255, 0],
+                    #         labels=[text[batch_idx]]
+                    #     )
+                    # )
 
 
-if __name__ == main():
+if __name__ == "__main__":
     main()
-    rr.notebook_show()
     
     
     
