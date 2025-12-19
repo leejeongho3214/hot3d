@@ -31,6 +31,7 @@ class ObjectModel:
         
         if isinstance(object_name, int):
             object_name = self.object_name[object_name]
+            
         point_set = self.point_sets[object_name].copy()
         obj_pc = self.obj_pcs[object_name].copy()
         obj_pc_normal = self.obj_pc_normals[object_name].copy()

@@ -1,43 +1,49 @@
-import glob
-import json
 import os
-import pickle
 import torch
-import tqdm
 import trimesh
 import numpy as np
 import pandas as pd
 import rerun as rr
-
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils import *
 
 
 rr.init("Input Data", spawn=True)
 
-object_model = ObjectModel('/Users/ijeongho/Desktop/hot3d_vis/obj.pkl')
+base_path = os.path.expanduser("~")
+object_model = ObjectModel(os.path.join(base_path, "Desktop/hot3d_vis/obj.pkl"))
 object_name_list = [
-    name for name in os.listdir("/Users/ijeongho/Desktop/hot3d_vis/part")
-    if not name.startswith(".")
+    name for name in os.listdir(os.path.join(base_path, 'Desktop/hot3d_vis/part'))
+    if (not name.startswith(".")) if (name != "cellphone")
 ]
 
 for object_name in object_name_list:
     # if object_model(object_name) is not None:
-    point_set, obj_pc, obj_pc_normal, obj_path = object_model(object_name)
-    # else: 
-    #     continue
-    
-
-    df = pd.read_csv(f'/Users/ijeongho/Desktop/hot3d_vis/part/{object_name}/face_labeled_rgb_mapping.csv')  # 방금 보여준 형태의 csv
-    mesh = trimesh.load(f'/Users/ijeongho/Desktop/hot3d_vis/part/{object_name}/{object_name}.ply')
+    try:
+        point_set, obj_pc, obj_pc_normal, obj_path = object_model(object_name)
+        # else: 
+        #     continue
+        
+        df = pd.read_csv(os.path.join(base_path, f'Desktop/hot3d_vis/part/{object_name}/face_labeled_rgb_mapping.csv'))  # 방금 보여준 형태의 csv
+        mesh = trimesh.load(os.path.join(base_path, f'Desktop/hot3d_vis/part/{object_name}/{object_name}.ply'))
+    except Exception as e:
+        print(f"Error loading data for {object_name}: {e}")
+        continue
 
     num_vertices = len(mesh.vertices)
     vertex_labels = np.full(num_vertices, -1)
 
-    for _, row in df.iterrows():
-        v1, v2, v3, label = int(row['v1']), int(row['v2']), int(row['v3']), int(row['label'])
-        for v in [v1, v2, v3]:
-            vertex_labels[v] = label 
-    vertex_labels[vertex_labels == -1] = 0
+    try:
+        for _, row in df.iterrows():
+            v1, v2, v3, label = int(row['v1']), int(row['v2']), int(row['v3']), int(row['label'])
+            for v in [v1, v2, v3]:
+                vertex_labels[v] = label 
+        vertex_labels[vertex_labels == -1] = 0
+
+    except Exception as e:
+        print(f"Error processing labels for {object_name}: {e}")
+        continue
                             
     fixed_colors = {
         0: [255, 0, 0],    # 빨강
@@ -73,4 +79,3 @@ for object_name in object_name_list:
             labels=["x", "y", "z"]
         ))
     
-    break
