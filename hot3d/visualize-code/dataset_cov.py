@@ -1,9 +1,24 @@
-import argparse
+
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
+import itertools
 import json
 import inspect
 import re
 from typing import Optional
-import itertools
+
+from projectaria_tools.core.sophus import SE3
+from projectaria_tools.utils.rerun_helpers import ToTransform3D
+import trimesh
+
+from scipy.ndimage import gaussian_filter1d
+from collections import defaultdict
+
+from data_loaders.mano_layer import MANOHandModel
+from hot3d.mano import build_mano_aa
 if not hasattr(inspect, "getargspec"):
     # Compatibility for chumpy on Python 3.11+
     inspect.getargspec = inspect.getfullargspec  # type: ignore[attr-defined]
@@ -14,29 +29,22 @@ for _name, _type in [("bool", bool), ("int", int), ("float", float), ("object", 
     if _name not in np.__dict__:
         setattr(np, _name, _type)
 
-from projectaria_tools.core.sophus import SE3
-from projectaria_tools.utils.rerun_helpers import ToTransform3D
 import trimesh
 
-from scipy.ndimage import gaussian_filter1d
 from collections import defaultdict
 
 import os
 import torch
 import numpy as np
 
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from rot import *
 
 import rerun as rr
 import pickle
 
-from data_loaders.mano_layer import MANOHandModel
-import os
+from hot3d_action_dataset import Hot3DActionDataset as _Hot3DActionDataset
 
-from mano import build_mano_aa
 
 def gaussian_smooth(vertices, sigma=1):
     return gaussian_filter1d(vertices, sigma=sigma, axis=0)
@@ -179,98 +187,66 @@ def _extract_object_key(text_entry: str) -> Optional[str]:
             return key
     return None
 
-def main(file_name = "acc_ori_train.pkl"):
-    rr.init("Input Data", spawn=True)
+
+# The saved pickle references "__main__.Hot3DActionDataset". Make sure this
+# name exists so pickle can resolve the dataset class.
+globals()["Hot3DActionDataset"] = _Hot3DActionDataset
+
+rr.init("Input Data", spawn=True)
+
+home = os.path.expanduser("~")
+with open(os.path.join(home, "Desktop/hot3d_vis/train_dataset.pkl"), "rb") as f:
+    item_list = pickle.load(f)
+
+for item_idx, item in enumerate(item_list):
+    obj_param = item['x_obj']
     
-    with open(os.path.join(home, f"Desktop/hot3d_vis/dataset/{file_name}"), "rb") as f:
-        item_list = pickle.load(f)
+    cov_map = item['cov_map']
+    text = item['text']
+    act_id = item['act_id']
 
-    for item_name in item_list.keys():
-        item = item_list[item_name]
-        l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
-        r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
+    entry_counts = defaultdict(int)
 
-        obj_param = item['x_obj']
-        l_hand, r_hand = item['x_lhand'], item['x_rhand']
+    for batch_idx in range(len(text)):
+        text_entry = text[batch_idx]
+
+        object_key = _extract_object_key(text_entry)
+        if object_key is None or object_key not in obj_pc:
+            print(f"[WARN] skip entry due to unresolved object: '{text_entry}' -> '{object_key}'")
+            continue
+
+        entry_counts[(object_key, text_entry)] += 1
+        sanitized_entry = re.sub(r"\s+", "_", text_entry.strip())
+        log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
+        base_path = log_prefix
+
+        obj_vertices = process_obj_result(
+            obj_pc[object_key], torch.as_tensor(obj_param[batch_idx]).detach().clone()
+        )
         
-        text = item['action']
-        act_id = item['act_id']
 
-        entry_counts = defaultdict(int)
-
-        for batch_idx in range(len(text)):
-            text_entry = text[batch_idx]
-
-            object_key = _extract_object_key(text_entry)
-            if object_key is None or object_key not in obj_pc:
-                print(f"[WARN] skip entry due to unresolved object: '{text_entry}' -> '{object_key}'")
-                continue
-
-            entry_counts[(object_key, text_entry)] += 1
-            sanitized_entry = re.sub(r"\s+", "_", text_entry.strip())
-            log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
-            base_path = log_prefix
-
-            r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, torch.tensor(r_hand[batch_idx]))
-            l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, torch.tensor(l_hand[batch_idx]))
-            obj_vertices = process_obj_result(obj_pc[object_key], torch.tensor(obj_param[batch_idx]))
+        for frame_idx in range(obj_vertices.shape[0]):
+            rr.set_time_sequence("frame", frame_idx)
             
-            r_mesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
-            l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
+            # rr.log(
+            #     f"{base_path}/object_pc",
+            #     rr.Points3D(
+            #         positions=obj_vertices[frame_idx],
+            #         radii=0.005,
+            #         colors=[0, 255, 0],
+            #         labels=[act_id[batch_idx]]
+            #     )
+            # )
 
-            for frame_idx in range(obj_vertices.shape[0]):
-                rr.set_time_sequence("frame", frame_idx)
-                
-                if "right" in text_entry.lower():
-                    rr.log(
-                        f"{base_path}/r_hand",
-                        rr.Mesh3D(
-                            vertex_positions=r_hand_vertices[frame_idx],
-                            triangle_indices=r_hand_faces,
-                            vertex_normals=r_mesh.vertex_normals,
-                        ),
-                    )
-                    
-                elif "both" in text_entry.lower():
-                    rr.log(
-                        f"{base_path}/r_hand",
-                        rr.Mesh3D(
-                            vertex_positions=r_hand_vertices[frame_idx],
-                            triangle_indices=r_hand_faces,
-                            vertex_normals=r_mesh.vertex_normals,
-                        ),
-                    )
-                    rr.log(
-                        f"{base_path}/l_hand",
-                        rr.Mesh3D(
-                            vertex_positions=l_hand_vertices[frame_idx],
-                            triangle_indices=l_hand_faces,
-                            vertex_normals=l_mesh.vertex_normals
-                        ),
-                    )
+            colors_cov = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
+            colors_cov[cov_map[batch_idx] == 1] = [255, 255, 0]
+            colors_cov[cov_map[batch_idx] == 0] = [0, 0, 255]
 
-
-                else:
-                    rr.log(
-                        f"{base_path}/l_hand",
-                        rr.Mesh3D(
-                            vertex_positions=l_hand_vertices[frame_idx],
-                            triangle_indices=l_hand_faces,
-                            vertex_normals=l_mesh.vertex_normals
-                        ),
-                    )
-                                
-                rr.log(
-                    f"{base_path}/object_pc",
-                    rr.Points3D(
-                        positions=obj_vertices[frame_idx],
-                        radii=0.005,
-                        colors=[0, 255, 0],
-                        labels=[act_id[batch_idx]]
-                    )
+            rr.log(
+                f"{base_path}/cov_map",
+                rr.Points3D(
+                    positions=obj_vertices[frame_idx],
+                    radii=0.005,
+                    colors=colors_cov,
                 )
-
-if __name__ == "__main__":
-    main(file_name = "acc_ori_train.pkl")
-    main(file_name = "acc_ori_eval.pkl")    
-    
+                )

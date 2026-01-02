@@ -146,6 +146,11 @@ _PART_KEYWORDS = [
   "tail",
 ]
 
+_PART_REMAP = {
+    # Canonicalize mislabeled parts for specific objects.
+    "can_soup": {"top": "rim"},
+}
+
 def _compute_layout_offset(sample_index: int, spacing: float = 0.4, per_row: int = 5) -> torch.Tensor:
     """
     Generate a simple grid offset so that each visualized sample is spaced apart.
@@ -239,6 +244,8 @@ def main():
                 continue
 
             part_keyword = _extract_part_keyword(text_entry) or "part"
+            if obj_key in _PART_REMAP and part_keyword in _PART_REMAP[obj_key]:
+                part_keyword = _PART_REMAP[obj_key][part_keyword]
 
             obj_log = _slugify_component(obj_key, "object")
             part_log = _slugify_component(part_keyword, "part")
