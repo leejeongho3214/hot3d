@@ -211,6 +211,11 @@ def main(file_name = "acc_ori_train.pkl"):
             log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
             base_path = log_prefix
 
+            # exclude_obj_list = ["dumbbell_5lb", "dvd_remote", "food_vegetables", "food_waffles", "mouse", "plate_bamboo", "potato_masher", "puzzle_toy", "spatula_red", "spoon_wooden"]
+
+            # if object_key not in exclude_obj_list:
+            #     continue
+            
             r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, torch.tensor(r_hand[batch_idx]))
             l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, torch.tensor(l_hand[batch_idx]))
             obj_vertices = process_obj_result(obj_pc[object_key], torch.tensor(obj_param[batch_idx]))

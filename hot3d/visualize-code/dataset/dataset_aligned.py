@@ -1,6 +1,3 @@
-import argparse
-import json
-import inspect
 import re
 from typing import Optional
 import itertools
@@ -14,7 +11,7 @@ import os
 import torch
 import trimesh
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 from projectaria_tools.core.sophus import SE3
 from projectaria_tools.utils.rerun_helpers import ToTransform3D
@@ -167,117 +164,115 @@ def main(file_name="acc_ori_train.pkl"):
     rr.init("Input Data", spawn=True)
 
     with open(os.path.join(home, f"Desktop/hot3d_vis/dataset/{file_name}"), "rb") as f:
-        item_list = pickle.load(f)
+        item = pickle.load(f)
 
-    for item_name in item_list.keys():
-        item = item_list[item_name]
-        l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
-        r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
+    l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
+    r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
 
-        obj_param = item["x_obj"]
-        l_hand, r_hand = item["x_lhand"], item["x_rhand"]
+    obj_param = item["x_obj"]
+    l_hand, r_hand = item["x_lhand"], item["x_rhand"]
 
-        text = item["action"]
-        act_id = item["act_id"]
+    text = item["action"]
+    act_id = item["act_id"]
 
-        entry_counts = defaultdict(int)
+    entry_counts = defaultdict(int)
 
-        for batch_idx in range(len(text)):
-            text_entry = text[batch_idx]
+    for batch_idx in range(len(text)):
+        text_entry = text[batch_idx]
 
-            object_key = _extract_object_key(text_entry)
-            if object_key is None or object_key not in obj_pc:
-                print(f"[WARN] skip entry due to unresolved object: '{text_entry}' -> '{object_key}'")
-                continue
+        object_key = _extract_object_key(text_entry)
+        if object_key is None or object_key not in obj_pc:
+            print(f"[WARN] skip entry due to unresolved object: '{text_entry}' -> '{object_key}'")
+            continue
 
-            obj_offset = torch.zeros(3, dtype=torch.float32)
+        obj_offset = torch.zeros(3, dtype=torch.float32)
 
-            entry_counts[(object_key, text_entry)] += 1
-            sanitized_entry = re.sub(r"\s+", "_", text_entry.strip())
-            sample_idx = next(_sample_counter)
-            log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
-            base_path = log_prefix
+        entry_counts[(object_key, text_entry)] += 1
+        sanitized_entry = re.sub(r"\s+", "_", text_entry.strip())
+        sample_idx = next(_sample_counter)
+        log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
+        base_path = log_prefix
 
-            r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, torch.tensor(r_hand[batch_idx]))
-            l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, torch.tensor(l_hand[batch_idx]))
-            obj_vertices, obj_rotmat, obj_trans = process_obj_result(
-                obj_pc[object_key], torch.tensor(obj_param[batch_idx])
-            )
+        r_hand_vertices, r_hand_faces = process_hand_result(r_hand_layer, torch.tensor(r_hand[batch_idx]))
+        l_hand_vertices, l_hand_faces = process_hand_result(l_hand_layer, torch.tensor(l_hand[batch_idx]))
+        obj_vertices, obj_rotmat, obj_trans = process_obj_result(
+            obj_pc[object_key], torch.tensor(obj_param[batch_idx])
+        )
 
-            r_mesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
-            l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
+        r_mesh = trimesh.Trimesh(vertices=r_hand_vertices[0], faces=r_hand_faces, process=False)
+        l_mesh = trimesh.Trimesh(vertices=l_hand_vertices[0], faces=l_hand_faces, process=False)
 
-            # Static object template at a fixed pose for this object key.
-            rr.log(
-                f"{base_path}/object_pc",
-                rr.Points3D(
-                    positions=obj_pc[object_key] + obj_offset,
-                    radii=0.005,
-                    colors=[0, 255, 0],
-                    labels=[act_id[batch_idx]],
-                ),
-                static=True,
-            )
+        # Static object template at a fixed pose for this object key.
+        rr.log(
+            f"{base_path}/object_pc",
+            rr.Points3D(
+                positions=obj_pc[object_key] + obj_offset,
+                radii=0.005,
+                colors=[0, 255, 0],
+                labels=[act_id[batch_idx]],
+            ),
+            static=True,
+        )
 
-            for frame_idx in range(obj_vertices.shape[0]):
-                rr.set_time_sequence("frame", frame_idx)
+        for frame_idx in range(obj_vertices.shape[0]):
+            rr.set_time_sequence("frame", frame_idx)
 
-                R = obj_rotmat[frame_idx]
-                t = obj_trans[frame_idx]
+            R = obj_rotmat[frame_idx]
+            t = obj_trans[frame_idx]
 
-                def to_obj_frame(verts):
-                    return torch.einsum("ij,kj->ki", R.T, verts - t) + obj_offset
+            def to_obj_frame(verts):
+                return torch.einsum("ij,kj->ki", R.T, verts - t) + obj_offset
 
-                r_hand_obj = to_obj_frame(r_hand_vertices[frame_idx])
-                l_hand_obj = to_obj_frame(l_hand_vertices[frame_idx])
-                obj_points = obj_pc[object_key] + obj_offset
-                r_colors = _compute_contact_colors(r_hand_obj, obj_points)
-                l_colors = _compute_contact_colors(l_hand_obj, obj_points)
+            r_hand_obj = to_obj_frame(r_hand_vertices[frame_idx])
+            l_hand_obj = to_obj_frame(l_hand_vertices[frame_idx])
+            obj_points = obj_pc[object_key] + obj_offset
+            r_colors = _compute_contact_colors(r_hand_obj, obj_points)
+            l_colors = _compute_contact_colors(l_hand_obj, obj_points)
 
-                if "right" in text_entry.lower():
-                    rr.log(
-                        f"{base_path}/r_hand",
-                        rr.Mesh3D(
-                            vertex_positions=r_hand_obj,
-                            triangle_indices=r_hand_faces,
-                            vertex_normals=r_mesh.vertex_normals,
-                            vertex_colors=r_colors,
-                        ),
-                    )
+            if "right" in text_entry.lower():
+                rr.log(
+                    f"{base_path}/r_hand",
+                    rr.Mesh3D(
+                        vertex_positions=r_hand_obj,
+                        triangle_indices=r_hand_faces,
+                        vertex_normals=r_mesh.vertex_normals,
+                        # vertex_colors=r_colors,
+                    ),
+                )
 
-                elif "both" in text_entry.lower():
-                    rr.log(
-                        f"{base_path}/r_hand",
-                        rr.Mesh3D(
-                            vertex_positions=r_hand_obj,
-                            triangle_indices=r_hand_faces,
-                            vertex_normals=r_mesh.vertex_normals,
-                            vertex_colors=r_colors,
-                        ),
-                    )
-                    rr.log(
-                        f"{base_path}/l_hand",
-                        rr.Mesh3D(
-                            vertex_positions=l_hand_obj,
-                            triangle_indices=l_hand_faces,
-                            vertex_normals=l_mesh.vertex_normals,
-                            vertex_colors=l_colors,
-                        ),
-                    )
+            elif "both" in text_entry.lower():
+                rr.log(
+                    f"{base_path}/r_hand",
+                    rr.Mesh3D(
+                        vertex_positions=r_hand_obj,
+                        triangle_indices=r_hand_faces,
+                        vertex_normals=r_mesh.vertex_normals,
+                        # vertex_colors=r_colors,
+                    ),
+                )
+                rr.log(
+                    f"{base_path}/l_hand",
+                    rr.Mesh3D(
+                        vertex_positions=l_hand_obj,
+                        triangle_indices=l_hand_faces,
+                        vertex_normals=l_mesh.vertex_normals,
+                        # vertex_colors=l_colors,
+                    ),
+                )
 
-                else:
-                    rr.log(
-                        f"{base_path}/l_hand",
-                        rr.Mesh3D(
-                            vertex_positions=l_hand_obj,
-                            triangle_indices=l_hand_faces,
-                            vertex_normals=l_mesh.vertex_normals,
-                            vertex_colors=l_colors,
-                        ),
-                    )
+            else:
+                rr.log(
+                    f"{base_path}/l_hand",
+                    rr.Mesh3D(
+                        vertex_positions=l_hand_obj,
+                        triangle_indices=l_hand_faces,
+                        vertex_normals=l_mesh.vertex_normals,
+                        # vertex_colors=l_colors,
+                    ),
+                )
 
 
 if __name__ == "__main__":
     # main(file_name="acc_ori_train.pkl")
     # main(file_name="acc_ori_eval.pkl")
-    main(file_name="acc_ori.pkl")
+    main(file_name="grab_ori.pkl")
