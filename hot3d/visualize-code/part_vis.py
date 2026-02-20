@@ -38,7 +38,8 @@ for object_name in object_name_list:
         for _, row in df.iterrows():
             v1, v2, v3, label = int(row['v1']), int(row['v2']), int(row['v3']), int(row['label'])
             for v in [v1, v2, v3]:
-                vertex_labels[v] = label 
+                if 0 <= v < num_vertices:
+                    vertex_labels[v] = label 
         vertex_labels[vertex_labels == -1] = 0
 
     except Exception as e:
@@ -58,9 +59,21 @@ for object_name in object_name_list:
         9: [128, 128, 128] # 회색
     }
 
-    colors = np.array([
-        fixed_colors.get(vertex_labels[o], [255, 255, 255]) for o in point_set
-    ], dtype=np.uint8)
+    point_set_idx = np.asarray(point_set)
+    if point_set_idx.shape[0] != 1024:
+        print(f"[WARN] {object_name}: point_set size {point_set_idx.shape[0]} (expected 1024)")
+    invalid_points = (point_set_idx < 0) | (point_set_idx >= num_vertices)
+    if np.any(invalid_points):
+        print(f"[WARN] {object_name}: {invalid_points.sum()} point_set indices out of range")
+    missing_labels = (vertex_labels == -1).sum()
+    if missing_labels > 0:
+        print(f"[WARN] {object_name}: {missing_labels} vertex_labels missing before fill")
+    colors = np.empty((point_set_idx.shape[0], 3), dtype=np.uint8)
+    for i, idx in enumerate(point_set_idx):
+        if 0 <= idx < num_vertices:
+            colors[i] = fixed_colors.get(vertex_labels[idx], [255, 255, 255])
+        else:
+            colors[i] = [255, 255, 255]
 
 
     rr.log(

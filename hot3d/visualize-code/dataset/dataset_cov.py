@@ -8,6 +8,7 @@ import itertools
 import json
 import inspect
 import re
+import argparse
 from typing import Optional
 
 from projectaria_tools.core.sophus import SE3
@@ -18,7 +19,6 @@ from scipy.ndimage import gaussian_filter1d
 from collections import defaultdict
 
 from data_loaders.mano_layer import MANOHandModel
-from hot3d.mano import build_mano_aa
 if not hasattr(inspect, "getargspec"):
     # Compatibility for chumpy on Python 3.11+
     inspect.getargspec = inspect.getfullargspec  # type: ignore[attr-defined]
@@ -188,19 +188,55 @@ def _extract_object_key(text_entry: str) -> Optional[str]:
     return None
 
 
+def _reduce_cov_counts(cov_frame: np.ndarray, num_points: int) -> Optional[np.ndarray]:
+    cov_counts = None
+    if cov_frame.ndim >= 2:
+        if cov_frame.shape[-1] == num_points:
+            axes = tuple(range(cov_frame.ndim - 1))
+            cov_counts = cov_frame.sum(axis=axes)
+        elif cov_frame.shape[0] == num_points:
+            axes = tuple(range(1, cov_frame.ndim))
+            cov_counts = cov_frame.sum(axis=axes)
+    elif cov_frame.ndim == 1 and cov_frame.shape[0] == num_points:
+        cov_counts = cov_frame
+    return cov_counts
+
+
+def _compute_point_colors(cov_values: np.ndarray) -> np.ndarray:
+    max_count = float(np.max(cov_values)) if np.max(cov_values) > 0 else 1.0
+    intensity = np.clip(cov_values / max_count, 0.0, 1.0).astype(np.float32)
+    low_color = np.array([0, 0, 255], dtype=np.float32)
+    high_color = np.array([255, 255, 0], dtype=np.float32)
+    return (low_color + (high_color - low_color) * intensity[:, None]).astype(np.uint8)
+
+
 # The saved pickle references "__main__.Hot3DActionDataset". Make sure this
 # name exists so pickle can resolve the dataset class.
 globals()["Hot3DActionDataset"] = _Hot3DActionDataset
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Visualize dataset cov maps.")
+    parser.add_argument(
+        "--mode",
+        choices=("avg", "individual", "both"),
+        default="avg",
+        help="avg: aggregated average per text, individual: per item, both: show both.",
+    )
+    return parser.parse_args()
+
+
 rr.init("Input Data", spawn=True)
+args = _parse_args()
 
 home = os.path.expanduser("~")
-with open(os.path.join(home, "Desktop/hot3d_vis/train_dataset.pkl"), "rb") as f:
+with open(os.path.join(home, "Desktop/hot3d_vis/dataset/grab_ori_bs.pkl"), "rb") as f:
     item_list = pickle.load(f)
 
-for item_idx, item in enumerate(item_list):
+aggregates = {}
+
+for item in item_list:
     obj_param = item['x_obj']
-    
+
     cov_map = item['cov_map']
     text = item['text']
     act_id = item['act_id']
@@ -211,8 +247,8 @@ for item_idx, item in enumerate(item_list):
         text_entry = text[batch_idx]
 
         object_key = _extract_object_key(text_entry)
-        if object_key is None or object_key not in obj_pc:
-            print(f"[WARN] skip entry due to unresolved object: '{text_entry}' -> '{object_key}'")
+
+        if object_key != "mug_white":
             continue
 
         entry_counts[(object_key, text_entry)] += 1
@@ -220,32 +256,85 @@ for item_idx, item in enumerate(item_list):
         log_prefix = f"{object_key}/{sanitized_entry}/{act_id[batch_idx]}"
         base_path = log_prefix
 
-        obj_vertices = process_obj_result(
-            obj_pc[object_key], torch.as_tensor(obj_param[batch_idx]).detach().clone()
-        )
+        num_points = obj_pc[object_key].shape[0]
+        cov_arr = np.asarray(cov_map[batch_idx])
+        style_covs = []
+        if cov_arr.ndim >= 3 and cov_arr.shape[-1] == num_points:
+            for style_idx in range(cov_arr.shape[0]):
+                style_arr = cov_arr[style_idx]
+                if style_arr.ndim >= 2:
+                    style_arr = style_arr.mean(axis=0)
+                cov_counts = _reduce_cov_counts(style_arr, num_points)
+                if cov_counts is None:
+                    continue
+                style_covs.append((style_idx, cov_counts))
+        else:
+            if cov_arr.ndim >= 2:
+                cov_arr = cov_arr.mean(axis=0)
+            cov_counts = _reduce_cov_counts(cov_arr, num_points)
+            if cov_counts is not None:
+                style_covs.append((0, cov_counts))
+
+        if args.mode in ("avg", "both"):
+            for style_idx, cov_counts in style_covs:
+                key = (object_key, text_entry, style_idx)
+                entry = aggregates.get(key)
+                if entry is None:
+                    aggregates[key] = {
+                        "object_key": object_key,
+                        "text": text_entry,
+                        "style_idx": style_idx,
+                        "sum": cov_counts.astype(np.float32),
+                        "count": 1,
+                    }
+                else:
+                    entry["sum"] += cov_counts
+                    entry["count"] += 1
         
-        for frame_idx in range(obj_vertices.shape[0]):
-            rr.set_time_sequence("frame", frame_idx)
-            
-            # rr.log(
-            #     f"{base_path}/object_pc",
-            #     rr.Points3D(
-            #         positions=obj_vertices[frame_idx],
-            #         radii=0.005,
-            #         colors=[0, 255, 0],
-            #         labels=[act_id[batch_idx]]
-            #     )
-            # )
+        if args.mode in ("individual", "both"):
+            obj_vertices = process_obj_result(
+                obj_pc[object_key], torch.as_tensor(obj_param[batch_idx]).detach().clone()
+            )
+            for frame_idx in range(obj_vertices.shape[0]):
+                rr.set_time_sequence("frame", frame_idx)
+                
+                # rr.log(
+                #     f"{base_path}/object_pc",
+                #     rr.Points3D(
+                #         positions=obj_vertices[frame_idx],
+                #         radii=0.005,
+                #         colors=[0, 255, 0],
+                #         labels=[act_id[batch_idx]]
+                #     )
+                # )
 
-            colors_cov = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
-            colors_cov[cov_map[batch_idx] == 1] = [255, 255, 0]
-            colors_cov[cov_map[batch_idx] == 0] = [0, 0, 255]
+                for style_idx, cov_counts in style_covs:
+                    colors_cov = _compute_point_colors(cov_counts)
+                    rr.log(
+                        f"{base_path}/style_{style_idx:02d}/cov_map",
+                        rr.Points3D(
+                            positions=obj_vertices[frame_idx],
+                            radii=0.005,
+                            colors=colors_cov,
+                        ),
+                    )
 
-            rr.log(
-                f"{base_path}/cov_map",
-                rr.Points3D(
-                    positions=obj_vertices[frame_idx],
-                    radii=0.005,
-                    colors=colors_cov,
-                )
-                )
+if args.mode in ("avg", "both"):
+    for entry in aggregates.values():
+        object_key = entry["object_key"]
+        text_entry = entry["text"]
+        style_idx = entry["style_idx"]
+        sanitized_entry = re.sub(r"\s+", "_", text_entry.strip())
+        base_path = f"{object_key}/{sanitized_entry}"
+        points = obj_pc[object_key].detach().cpu().numpy()
+        cov_avg = entry["sum"] / max(entry["count"], 1)
+        colors_cov = _compute_point_colors(cov_avg)
+        rr.log(
+            f"{base_path}/style_{style_idx:02d}/cov_map_avg",
+            rr.Points3D(
+                positions=points,
+                radii=0.005,
+                colors=colors_cov,
+            ),
+            static=True,
+        )

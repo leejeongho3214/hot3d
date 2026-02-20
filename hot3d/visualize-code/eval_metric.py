@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import inspect
 import re
@@ -55,10 +56,9 @@ import rerun as rr
 import pickle
 
 
-from data_loaders.mano_layer import MANOHandModel
 import os
-
 from mano import build_mano_aa
+
 
 
 _rng = np.random.default_rng()
@@ -99,10 +99,6 @@ class ObjectModel:
 
 
 home = os.path.expanduser("~")
-mano_hand_model_path = os.path.join(home, "Desktop/hot3d_vis/mano_v1_2/models")
-mano_hand_model = None
-if mano_hand_model_path is not None:
-    mano_hand_model = MANOHandModel(mano_hand_model_path)
 
 
 def process_hand_result(hand_layer, hand_params):
@@ -161,6 +157,14 @@ def _to_torch(data) -> torch.Tensor:
     return torch.as_tensor(data, dtype=torch.float32)
 
 
+def _set_frame_time(frame_idx: int) -> None:
+    # Rerun API differs by version.
+    if hasattr(rr, "set_time_sequence"):
+        rr.set_time_sequence("frame", frame_idx)
+    else:
+        rr.set_time("frame", sequence=frame_idx)
+
+
 def _compute_cov_map_from_course(
     course_lhand,
     course_rhand,
@@ -186,15 +190,182 @@ def _compute_contact_from_vertices(
         obj_frame = obj_vertices_np[frame_idx]
         frame_contact = np.zeros(obj_frame.shape[0], dtype=bool)
         if l_hand_vertices_np is not None:
-            l_frame = l_hand_vertices_np[min(frame_idx, l_hand_vertices_np.shape[0] - 1)]
+            l_frame = l_hand_vertices_np[
+                min(frame_idx, l_hand_vertices_np.shape[0] - 1)
+            ]
             l_dist = np.linalg.norm(obj_frame[:, None, :] - l_frame[None, :, :], axis=2)
             frame_contact |= l_dist.min(axis=1) < threshold
         if r_hand_vertices_np is not None:
-            r_frame = r_hand_vertices_np[min(frame_idx, r_hand_vertices_np.shape[0] - 1)]
+            r_frame = r_hand_vertices_np[
+                min(frame_idx, r_hand_vertices_np.shape[0] - 1)
+            ]
             r_dist = np.linalg.norm(obj_frame[:, None, :] - r_frame[None, :, :], axis=2)
             frame_contact |= r_dist.min(axis=1) < threshold
         contact_per_frame[frame_idx] = frame_contact
     return contact_per_frame
+
+
+def _load_part_map(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_part_map_path() -> Optional[str]:
+    candidates = [
+        os.path.join(os.path.expanduser("~"), "label_merged.json"),
+        os.path.join(os.path.expanduser("~"), "labels_merged.json"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "label_merged.json")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "labels_merged.json")),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _part_mask_from_map(
+    part_map: dict, object_key: str, part_key: str, num_points: int
+) -> Optional[np.ndarray]:
+    if object_key not in part_map:
+        return None
+    parts = part_map.get(object_key, {})
+    if part_key not in parts:
+        return None
+    indices = np.asarray(parts[part_key], dtype=np.int64)
+    if indices.size == 0:
+        return None
+    indices = indices[(indices >= 0) & (indices < num_points)]
+    if indices.size == 0:
+        return None
+    mask = np.zeros(num_points, dtype=bool)
+    mask[indices] = True
+    return mask
+
+
+def _precision_recall(
+    contact_mask: np.ndarray, part_mask: np.ndarray
+) -> tuple[float, float, float]:
+    tp = np.logical_and(contact_mask, part_mask).sum()
+    contact_count = contact_mask.sum()
+    part_count = part_mask.sum()
+    precision = (tp / contact_count) if contact_count > 0 else 0.0
+    recall = (tp / part_count) if part_count > 0 else 0.0
+    f1 = (
+        (2 * precision * recall / (precision + recall))
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return float(precision), float(recall), float(f1)
+
+
+def _framewise_binary_from_cov_map(
+    cov_map, nframes: int, num_points: int
+) -> np.ndarray:
+    """Best-effort conversion of a cov/contact map into frame-wise binary contact."""
+    if cov_map is None or nframes <= 0:
+        return np.zeros((max(nframes, 0),), dtype=bool)
+    arr = np.asarray(cov_map)
+    if arr.size == 0:
+        return np.zeros((nframes,), dtype=bool)
+    arr = np.squeeze(arr)
+
+    # If any axis matches nframes, treat it as the frame axis.
+    frame_axes = [ax for ax, size in enumerate(arr.shape) if size == nframes]
+    if frame_axes:
+        frame_axis = frame_axes[0]
+        arr_f = np.moveaxis(arr, frame_axis, 0)
+        if arr_f.ndim == 1:
+            return arr_f > 0
+        arr_f = arr_f.reshape(nframes, -1)
+        return (arr_f > 0).any(axis=1)
+
+    # No clear frame axis: collapse to a scalar and broadcast.
+    scalar_contact = bool(np.any(arr > 0))
+    return np.full((nframes,), scalar_contact, dtype=bool)
+
+
+def _reduce_cov_to_point_mask(cov_map, num_points: int) -> Optional[np.ndarray]:
+    """Reduce a cov/contact map to a per-point boolean mask when possible."""
+    if cov_map is None:
+        return None
+    arr = np.asarray(cov_map)
+    if arr.ndim == 1 and arr.shape[0] == num_points:
+        return arr > 0
+    if arr.size == 0:
+        return None
+    point_axes = [ax for ax, size in enumerate(arr.shape) if size == num_points]
+    if not point_axes:
+        return None
+    point_axis = point_axes[0]
+    arr_p = np.moveaxis(arr, point_axis, -1)
+    reduce_axes = tuple(range(arr_p.ndim - 1))
+    return (arr_p > 0).any(axis=reduce_axes)
+
+
+def _framewise_point_mask_from_cov_map(cov_map, num_points: int) -> Optional[np.ndarray]:
+    """Best-effort conversion to per-frame per-point mask of shape [T, num_points]."""
+    if cov_map is None or num_points <= 0:
+        return None
+    arr = np.asarray(cov_map)
+    if arr.size == 0:
+        return None
+    arr = np.squeeze(arr)
+    if arr.ndim == 0:
+        return np.full((1, num_points), bool(arr > 0), dtype=bool)
+
+    point_axes = [ax for ax, size in enumerate(arr.shape) if size == num_points]
+    if not point_axes:
+        return None
+
+    point_axis = point_axes[0]
+    arr_p = np.moveaxis(arr, point_axis, -1)  # [..., num_points]
+    if arr_p.ndim == 1:
+        return (arr_p > 0).reshape(1, num_points)
+
+    # Use the largest non-point axis as frame axis, collapse the rest.
+    non_point_shape = arr_p.shape[:-1]
+    frame_axis = int(np.argmax(non_point_shape))
+    arr_fp = np.moveaxis(arr_p, frame_axis, 0)  # [T, ..., num_points]
+    if arr_fp.ndim > 2:
+        reduce_axes = tuple(range(1, arr_fp.ndim - 1))
+        arr_fp = (arr_fp > 0).any(axis=reduce_axes)
+    else:
+        arr_fp = arr_fp > 0
+
+    if arr_fp.ndim != 2 or arr_fp.shape[1] != num_points or arr_fp.shape[0] <= 0:
+        return None
+    return arr_fp.astype(bool)
+
+
+def _binary_contact_metrics(input_contact: np.ndarray, gen_contact: np.ndarray) -> dict:
+    """Compute frame-wise accuracy, precision, and recall with confusion counts."""
+    if input_contact.shape != gen_contact.shape:
+        raise ValueError("input_contact and gen_contact must have the same shape.")
+    input_contact = input_contact.astype(bool)
+    gen_contact = gen_contact.astype(bool)
+    tp = int(np.logical_and(gen_contact, input_contact).sum())
+    fp = int(np.logical_and(gen_contact, ~input_contact).sum())
+    fn = int(np.logical_and(~gen_contact, input_contact).sum())
+    tn = int(np.logical_and(~gen_contact, ~input_contact).sum())
+    total = max(tp + fp + fn + tn, 1)
+    acc = (tp + tn) / total
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2.0 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+    return {
+        "acc": float(acc),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "total": int(total),
+    }
 
 
 def _topk_mass(counts: np.ndarray, k_ratio: float = 0.05) -> float:
@@ -392,247 +563,535 @@ for obj_name in object_model.obj_pcs.keys():
 l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
 r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
 
+_CONTACT_METRIC_HEADER = [
+    "file_name",
+    "method",
+    "text",
+    "acc",
+    "precision",
+    "recall",
+    "f1",
+    "tp",
+    "fp",
+    "fn",
+    "tn",
+    "total",
+]
 
-def visualize_rr(recoding_name, idx):
+_TARGET_TEXTS = [
+    "Grab handle of mug_patterned with right hand.",
+    "Grab handle of mug_white with right hand.",
+]
+
+
+def _render_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+    sep = "-+-".join("-" * width for width in widths)
+    out = []
+    out.append(" | ".join(str(h).ljust(widths[i]) for i, h in enumerate(headers)))
+    out.append(sep)
+    for row in rows:
+        out.append(" | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
+    return "\n".join(out)
+
+
+def _aggregate_metrics(metrics_list: list[dict], totals: dict) -> dict:
+    if not metrics_list:
+        return {}
+    accs = [m["acc"] for m in metrics_list]
+    precs = [m["precision"] for m in metrics_list]
+    recs = [m["recall"] for m in metrics_list]
+    f1s = [m["f1"] for m in metrics_list]
+    sample_count = (
+        int(sum(m.get("samples", 1) for m in metrics_list))
+        if metrics_list and isinstance(metrics_list[0], dict)
+        else len(metrics_list)
+    )
+    return {
+        "acc": float(np.mean(accs)),
+        "precision": float(np.mean(precs)),
+        "recall": float(np.mean(recs)),
+        "f1": float(np.mean(f1s)),
+        "tp": int(totals["tp"]),
+        "fp": int(totals["fp"]),
+        "fn": int(totals["fn"]),
+        "tn": int(totals["tn"]),
+        "total": int(totals["total"]),
+        "samples": sample_count,
+    }
+
+
+def _print_file_text_metrics(file_name: str, per_text_rows: list[dict]) -> None:
+    if not per_text_rows:
+        print(f"[{file_name}] no valid metrics")
+        return
+    headers = ["text", "samples", "acc", "precision", "recall", "f1"]
+    rows = [
+        [
+            row["text"],
+            str(row["samples"]),
+            f"{row['acc']:.3f}",
+            f"{row['precision']:.3f}",
+            f"{row['recall']:.3f}",
+            f"{row['f1']:.3f}",
+        ]
+        for row in sorted(per_text_rows, key=lambda x: x["f1"], reverse=True)
+    ]
+    print(f"\n[{file_name}] per-text metrics")
+    print(_render_table(headers, rows))
+
+
+def _write_metrics_csv(out_csv: str, all_results: list[dict]) -> None:
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_CONTACT_METRIC_HEADER)
+        for result in all_results:
+            file_name = result["file_name"]
+            for row in result["per_text_rows"]:
+                writer.writerow(
+                    [
+                        file_name,
+                        "gt_cov_map vs actual_contact",
+                        row["text"],
+                        f"{row['acc']:.4f}",
+                        f"{row['precision']:.4f}",
+                        f"{row['recall']:.4f}",
+                        f"{row['f1']:.4f}",
+                        row["tp"],
+                        row["fp"],
+                        row["fn"],
+                        row["tn"],
+                        row["total"],
+                    ]
+                )
+
+
+def _print_cross_file_summary(all_results: list[dict]) -> None:
+    headers = ["file", "texts", "samples", "acc", "precision", "recall", "f1"]
+    rows = []
+    for result in sorted(all_results, key=lambda x: x["overall"]["f1"], reverse=True):
+        overall = result["overall"]
+        rows.append(
+            [
+                result["file_name"],
+                str(result["num_texts"]),
+                str(overall["samples"]),
+                f"{overall['acc']:.3f}",
+                f"{overall['precision']:.3f}",
+                f"{overall['recall']:.3f}",
+                f"{overall['f1']:.3f}",
+            ]
+        )
+    if rows:
+        print("\n=== Cross-file summary (sorted by F1) ===")
+        print(_render_table(headers, rows))
+
+
+def _safe_div(num: float, den: float) -> float:
+    return float(num / den) if den > 0 else 0.0
+
+
+def _metrics_from_confusion(tp: int, fp: int, fn: int, tn: int) -> dict:
+    total = tp + fp + fn + tn
+    acc = _safe_div(tp + tn, total)
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    f1 = (
+        float((2.0 * precision * recall) / (precision + recall))
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return {
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tn": int(tn),
+        "total": int(total),
+    }
+
+
+def _print_target_text_metric_rankings(
+    all_results: list[dict], target_texts: list[str]
+) -> None:
+    target_lookup = {text.lower(): text for text in target_texts}
+    merged = {
+        text: {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "samples": 0}
+        for text in target_texts
+    }
+
+    for result in all_results:
+        for row in result.get("per_text_rows", []):
+            text_key = str(row.get("text", "")).lower()
+            if text_key not in target_lookup:
+                continue
+            canonical = target_lookup[text_key]
+            merged[canonical]["tp"] += int(row.get("tp", 0))
+            merged[canonical]["fp"] += int(row.get("fp", 0))
+            merged[canonical]["fn"] += int(row.get("fn", 0))
+            merged[canonical]["tn"] += int(row.get("tn", 0))
+            merged[canonical]["samples"] += int(row.get("samples", 0))
+
+    available = []
+    for text in target_texts:
+        counts = merged[text]
+        conf = _metrics_from_confusion(
+            counts["tp"], counts["fp"], counts["fn"], counts["tn"]
+        )
+        conf["text"] = text
+        conf["samples"] = counts["samples"]
+        if conf["total"] > 0:
+            available.append(conf)
+
+    if not available:
+        print("\n=== Target text ranking ===")
+        print("No matching samples found for target texts.")
+        return
+
+    print("\n=== Target text ranking (metric-wise) ===")
+    for metric in ["acc", "precision", "recall", "f1"]:
+        ranked = sorted(
+            available, key=lambda x: (-x[metric], x["text"].lower())
+        )
+        print(f"\n[{metric}]")
+        for idx, row in enumerate(ranked, start=1):
+            print(
+                f"{idx}. {row['text']} | {metric}={row[metric]:.4f} | "
+                f"samples={row['samples']}"
+            )
+
+
+def visualize_rr(recoding_name, idx, visualize=True):
+    file_name = os.path.basename(recoding_name)
+
     with open(recoding_name, "rb") as f:
         item = pickle.load(f)
 
         action_to_sample_counts = defaultdict(int)
-        overlap_stats = defaultdict(list)
-        reverse_overlap_stats = defaultdict(list)
-        diversity_stats = defaultdict(list)
-        sample_diversity_masks = defaultdict(list)
-        pkl_sample_diversity_masks = defaultdict(list)
+        contact_metric_stats = defaultdict(list)
+        contact_metric_totals = defaultdict(
+            lambda: {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "total": 0}
+        )
 
         for (
-            x_lhand,
-            x_rhand,
+            fine_lhand,
+            fine_rhand,
             x_obj,
             text,
             course_lhand,
             course_rhand,
+            gt_obj,
+            cond_enc,
+            gt_cov_map,
+            est_cov_map,
             _,
-            _,
-            _,
-            cov_map,
-            # cov_map,
         ) in item:
-            for batch_idx in range(32):
-                text_entry = str(text)
+            for batch_idx in range(len(course_lhand)):
+                text_entry = str(text[batch_idx])
                 object_key, action_key = _build_grouping_keys(text_entry)
                 base_path = _sanitize_entity_path(object_key)
                 text_path = _sanitize_entity_path(text_entry)
                 hand_path = "r_hand" if "right" in text_entry.lower() else "l_hand"
                 sample_idx = action_to_sample_counts[action_key]
                 action_to_sample_counts[action_key] += 1
-                sample_pred_path = f"{idx}/original/fine/{base_path}/{text_path}/sample_{sample_idx:03d}"
-                sample_gt_path = f"{idx}/original/course/{base_path}/{text_path}/sample_{sample_idx:03d}"
-
-                # if text_entry.split("of ")[-1].split(" with")[0].lower() not in ["mug_white", "flask", "mug_patterned"]:
+                sample_gt_path = (
+                    f"runs/{_sanitize_entity_path(idx)}/original/course/"
+                    f"{base_path}/{text_path}/sample_{sample_idx:03d}"
+                )
 
                 obj_name = text_entry.split("of ")[-1].split(" with")[0].lower()
-                if obj_name not in [
-                    "mug_white"
-                ]:
+
+                if obj_name not in obj_pc:
+                    print(f"[WARN] unresolved object key: '{obj_name}' from text '{text_entry}'")
                     continue
-
-                # r_hand_vertices, r_hand_faces = process_hand_result(
-                #     r_hand_layer, x_rhand[batch_idx]
-                # )
-                # l_hand_vertices, l_hand_faces = process_hand_result(
-                #     l_hand_layer, x_lhand[batch_idx]
-                # )
-
                 obj_vertices = process_obj_result(obj_pc[obj_name], x_obj[batch_idx])
-
-                r_hand_vertices_gt, r_hand_faces, r_hand_joints = process_hand_result(
-                    r_hand_layer, course_rhand[batch_idx]
+                obj_vertices_np = obj_vertices.detach().cpu().numpy()
+                gt_cov_map_raw = gt_cov_map[batch_idx] if gt_cov_map is not None else None
+                est_cov_map_raw = (
+                    est_cov_map[batch_idx] if est_cov_map is not None else None
                 )
-                l_hand_vertices_gt, l_hand_faces, l_hand_joints = process_hand_result(
-                    l_hand_layer, course_lhand[batch_idx]
-                )
-                obj_vertices_gt = obj_vertices
-
-                r_mesh = trimesh.Trimesh(
-                    vertices=r_hand_vertices_gt[0], faces=r_hand_faces, process=False
-                )
-                l_mesh = trimesh.Trimesh(
-                    vertices=l_hand_vertices_gt[0], faces=l_hand_faces, process=False
-                )
-
-                obj_vertices_np = obj_vertices_gt
-                l_hand_joints_np = (
-                    l_hand_joints
-                    if "left" in text_entry.lower()
-                    else None
-                )
-                r_hand_joints_np = (
-                    r_hand_joints
-                    if "right" in text_entry.lower()
-                    else None
-                )
-                contact_per_frame = _compute_contact_from_vertices(
-                    obj_vertices_np,
-                    l_hand_joints_np,
-                    r_hand_joints_np,
-                )
-                contact_cumulative = np.cumsum(contact_per_frame, axis=0) > 0
-                computed_cov_map = contact_cumulative[-1].astype(np.float32)
-                computed_counts = contact_per_frame.sum(axis=0).astype(np.float32)
-                pkl_cov_map = cov_map[batch_idx] if cov_map is not None else None
-
-                if pkl_cov_map is not None:
-                    pkl_cov_map = np.asarray(pkl_cov_map)
-                    if pkl_cov_map.ndim > 1:
-                        pkl_cov_map = pkl_cov_map.any(axis=0).astype(np.float32)
 
                 if obj_vertices_np is None:
                     continue
 
-                pkl_mask = None
-                if pkl_cov_map is not None and pkl_cov_map.shape[0] == obj_vertices_np.shape[1]:
-                    pkl_mask = pkl_cov_map > 0
+                num_points = obj_vertices_np.shape[1]
+                obj_nframes = obj_vertices_np.shape[0]
+                gt_frame_mask = _framewise_point_mask_from_cov_map(gt_cov_map_raw, num_points)
+                est_frame_mask = _framewise_point_mask_from_cov_map(est_cov_map_raw, num_points)
+                gt_point_mask = (
+                    gt_frame_mask.any(axis=0)
+                    if gt_frame_mask is not None
+                    else _reduce_cov_to_point_mask(gt_cov_map_raw, num_points)
+                )
+                est_point_mask = (
+                    est_frame_mask.any(axis=0)
+                    if est_frame_mask is not None
+                    else _reduce_cov_to_point_mask(est_cov_map_raw, num_points)
+                )
 
-                for frame_idx in range(contact_cumulative.shape[0]):
-                    rr.set_time_sequence("sample", sample_idx)
-                    rr.set_time_sequence("frame", frame_idx)
+                r_hand_vertices_gt, r_hand_faces, _ = process_hand_result(
+                    r_hand_layer, _to_torch(course_rhand[batch_idx])
+                )
+                l_hand_vertices_gt, l_hand_faces, _ = process_hand_result(
+                    l_hand_layer, _to_torch(course_lhand[batch_idx])
+                )
+                r_hand_np = r_hand_vertices_gt.detach().cpu().numpy()
+                l_hand_np = l_hand_vertices_gt.detach().cpu().numpy()
+                use_right = "right" in text_entry.lower()
+                use_left = "left" in text_entry.lower()
+                if not use_right and not use_left:
+                    use_right = True
+                    use_left = True
+                actual_frame_mask = _compute_contact_from_vertices(
+                    obj_vertices_np,
+                    l_hand_np if use_left else None,
+                    r_hand_np if use_right else None,
+                )
+                actual_point_mask = actual_frame_mask.any(axis=0)
+                # For gt-vs-actual comparison, use cumulative actual contact over time.
+                actual_cumulative_frame_mask = np.logical_or.accumulate(
+                    actual_frame_mask, axis=0
+                )
+
+                if gt_point_mask is not None and gt_point_mask.shape == actual_point_mask.shape:
+                    point_metrics = _binary_contact_metrics(gt_point_mask, actual_point_mask)
+                    contact_metric_stats[text_entry].append(point_metrics)
+                    totals = contact_metric_totals[text_entry]
+                    totals["tp"] += point_metrics["tp"]
+                    totals["fp"] += point_metrics["fp"]
+                    totals["fn"] += point_metrics["fn"]
+                    totals["tn"] += point_metrics["tn"]
+                    totals["total"] += point_metrics["total"]
+
+                if visualize:
+                    r_mesh = trimesh.Trimesh(
+                        vertices=r_hand_vertices_gt[0], faces=r_hand_faces, process=False
+                    )
+                    l_mesh = trimesh.Trimesh(
+                        vertices=l_hand_vertices_gt[0], faces=l_hand_faces, process=False
+                    )
+
+                render_nframes = obj_nframes
+                if visualize:
                     if "right" in text_entry.lower():
-                        rr.log(
-                            f"{sample_gt_path}/{hand_path}",
-                            rr.Mesh3D(
-                                vertex_positions=r_hand_vertices_gt[frame_idx],
-                                triangle_indices=r_hand_faces,
-                                vertex_normals=r_mesh.vertex_normals,
-                            ),
-                        )
-
+                        render_nframes = min(render_nframes, r_hand_vertices_gt.shape[0])
+                    elif "left" in text_entry.lower():
+                        render_nframes = min(render_nframes, l_hand_vertices_gt.shape[0])
                     else:
-                        rr.log(
-                            f"{sample_gt_path}/{hand_path}",
-                            rr.Mesh3D(
-                                vertex_positions=l_hand_vertices_gt[frame_idx],
-                                triangle_indices=l_hand_faces,
-                                vertex_normals=l_mesh.vertex_normals,
-                            ),
+                        render_nframes = min(
+                            render_nframes,
+                            r_hand_vertices_gt.shape[0],
+                            l_hand_vertices_gt.shape[0],
                         )
+                if actual_frame_mask is not None and actual_frame_mask.shape[0] > 0:
+                    render_nframes = min(render_nframes, actual_frame_mask.shape[0])
+                render_nframes = max(render_nframes, 1)
+
+                for frame_idx in range(render_nframes):
+                    if visualize:
+                        _set_frame_time(frame_idx)
+                        if "right" in text_entry.lower():
+                            rr.log(
+                                f"{sample_gt_path}/{hand_path}",
+                                rr.Mesh3D(
+                                    vertex_positions=r_hand_vertices_gt[frame_idx],
+                                    triangle_indices=r_hand_faces,
+                                    vertex_normals=r_mesh.vertex_normals,
+                                ),
+                            )
+                        elif "left" in text_entry.lower():
+                            rr.log(
+                                f"{sample_gt_path}/{hand_path}",
+                                rr.Mesh3D(
+                                    vertex_positions=l_hand_vertices_gt[frame_idx],
+                                    triangle_indices=l_hand_faces,
+                                    vertex_normals=l_mesh.vertex_normals,
+                                ),
+                            )
+                        else:
+                            rr.log(
+                                f"{sample_gt_path}/r_hand",
+                                rr.Mesh3D(
+                                    vertex_positions=r_hand_vertices_gt[frame_idx],
+                                    triangle_indices=r_hand_faces,
+                                    vertex_normals=r_mesh.vertex_normals,
+                                ),
+                            )
+                            rr.log(
+                                f"{sample_gt_path}/l_hand",
+                                rr.Mesh3D(
+                                    vertex_positions=l_hand_vertices_gt[frame_idx],
+                                    triangle_indices=l_hand_faces,
+                                    vertex_normals=l_mesh.vertex_normals,
+                                ),
+                            )
                     obj_frame_np = obj_vertices_np[frame_idx]
                     colors_cov = np.zeros((obj_frame_np.shape[0], 3), dtype=np.uint8)
                     colors_cov[:] = [0, 0, 255]
 
-                    computed_mask = contact_cumulative[frame_idx]
-                    colors_cov[computed_mask] = [0, 255, 0]
+                    gt_mask_now = None
+                    est_mask_now = None
+                    actual_mask_cumulative_now = None
+                    if gt_frame_mask is not None:
+                        gt_idx = min(frame_idx, gt_frame_mask.shape[0] - 1)
+                        gt_mask_now = gt_frame_mask[gt_idx]
+                    elif gt_point_mask is not None:
+                        gt_mask_now = gt_point_mask
 
-                    if pkl_mask is not None:
-                        colors_cov[pkl_mask] = [255, 255, 0]
-                        overlap_mask = pkl_mask & computed_mask
-                        colors_cov[overlap_mask] = [255, 0, 0]
+                    if est_frame_mask is not None:
+                        est_idx = min(frame_idx, est_frame_mask.shape[0] - 1)
+                        est_mask_now = est_frame_mask[est_idx]
+                    elif est_point_mask is not None:
+                        est_mask_now = est_point_mask
 
-                    rr.log(
-                        f"{sample_gt_path}/contact_map_compare",
-                        rr.Points3D(
-                            positions=obj_frame_np,
-                            radii=0.005,
-                            colors=colors_cov,
-                        ),
-                    )
+                    if actual_frame_mask is not None:
+                        actual_mask_cumulative_now = actual_cumulative_frame_mask[frame_idx]
+                        actual_mask_compare_now = actual_cumulative_frame_mask[frame_idx]
+                    else:
+                        actual_mask_compare_now = None
 
-                if pkl_mask is not None:
-                    final_mask = contact_cumulative[-1]
-                    overlap_mask = pkl_mask & final_mask
-                    denom_pkl = pkl_mask.sum()
-                    denom_calc = final_mask.sum()
-                    if denom_pkl > 0:
-                        overlap_pct = (overlap_mask.sum() / denom_pkl) * 100.0
-                        overlap_stats[text_entry].append(float(overlap_pct))
-                    if denom_calc > 0:
-                        reverse_overlap_pct = (overlap_mask.sum() / denom_calc) * 100.0
-                        reverse_overlap_stats[text_entry].append(float(reverse_overlap_pct))
-
-                if computed_counts is not None:
-                    diversity_stats[text_entry].append(
-                        (
-                            _topk_mass(computed_counts, 0.05),
-                            _gini_index(computed_counts),
-                            _simpson_diversity(computed_counts),
+                    if visualize:
+                        colors_actual = np.zeros((obj_frame_np.shape[0], 3), dtype=np.uint8)
+                        colors_actual[:] = [0, 0, 255]
+                        if actual_mask_cumulative_now is not None:
+                            colors_actual[actual_mask_cumulative_now] = [0, 255, 0]
+                        rr.log(
+                            f"{sample_gt_path}/contact_map_actual",
+                            rr.Points3D(
+                                positions=obj_frame_np,
+                                radii=0.005,
+                                colors=colors_actual,
+                            ),
                         )
-                    )
-                if computed_cov_map is not None:
-                    mask = computed_cov_map > 0
-                    sample_diversity_masks[text_entry].append(mask)
 
-                if pkl_mask is not None:
-                    pkl_sample_diversity_masks[text_entry].append(pkl_mask)
+                        # Keep a comparison view with actual contact only.
+                        if actual_mask_compare_now is not None:
+                            colors_cov[actual_mask_compare_now] = [0, 255, 0]
+                        rr.log(
+                            f"{sample_gt_path}/contact_map_compare",
+                            rr.Points3D(
+                                positions=obj_frame_np,
+                                radii=0.005,
+                                colors=colors_cov,
+                            ),
+                        )
 
-                rr.log(
-                    f"{sample_gt_path}/contact_map_compare",
-                    rr.Points3D(
-                        positions=obj_frame_np,
-                        radii=0.005,
-                        colors=colors_cov,
-                    ),
-                )
+        per_text_rows = []
+        for text_key, metrics_list in contact_metric_stats.items():
+            if not metrics_list:
+                continue
+            totals = contact_metric_totals.get(
+                text_key, {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "total": 0}
+            )
+            agg = _aggregate_metrics(metrics_list, totals)
+            if not agg:
+                continue
+            agg["text"] = text_key
+            per_text_rows.append(agg)
 
-        if overlap_stats:
-            print("Contact overlap (%) per text")
-            for text_key, values in overlap_stats.items():
-                avg_pct = float(np.mean(values)) if values else 0.0
-                reverse_values = reverse_overlap_stats.get(text_key, [])
-                avg_reverse = float(np.mean(reverse_values)) if reverse_values else 0.0
-                print(f"- {text_key}: pkl<-calc ⬆️  {avg_pct:.2f}% | calc<-pkl  ⬆️  {avg_reverse:.2f}%")
+        if per_text_rows:
+            _print_file_text_metrics(file_name, per_text_rows)
+            overall = _aggregate_metrics(
+                [row for row in per_text_rows],
+                {
+                    "tp": sum(row["tp"] for row in per_text_rows),
+                    "fp": sum(row["fp"] for row in per_text_rows),
+                    "fn": sum(row["fn"] for row in per_text_rows),
+                    "tn": sum(row["tn"] for row in per_text_rows),
+                    "total": sum(row["total"] for row in per_text_rows),
+                },
+            )
+        else:
+            overall = {
+                "acc": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "tp": 0,
+                "fp": 0,
+                "fn": 0,
+                "tn": 0,
+                "total": 0,
+                "samples": 0,
+            }
 
-        # if diversity_stats: 
-        #     print("Contact diversity per text (top5%, gini, simpson)")
-        #     for text_key, values in diversity_stats.items():
-        #         if not values:
-        #             print(f"- {text_key}: 0.000, 0.000, 0.000")
-        #             continue
-        #         arr = np.asarray(values, dtype=np.float32)
-        #         avg_vals = arr.mean(axis=0)
-        #         print(
-        #             f"- {text_key}: {avg_vals[0]:.3f}, {avg_vals[1]:.3f}, {avg_vals[2]:.3f}"
-        #         )
-        # if sample_diversity_masks:
-        #     print("Contact diversity across samples per text (coverage, jaccard, gini, simpson)")
-        #     for text_key, masks in sample_diversity_masks.items():
-        #         if not masks:
-        #             print(f"- {text_key}: 0.000, 0.000, 0.000, 0.000")
-        #             continue
-        #         union_mask = np.logical_or.reduce(masks)
-        #         coverage = _coverage_ratio(union_mask)
-        #         jaccard = _jaccard_diversity_samples(masks)
-        #         freq_counts = np.sum(np.stack(masks, axis=0), axis=0).astype(np.float32)
-        #         gini = _gini_index(freq_counts)
-        #         simpson = _simpson_diversity(freq_counts)
-        #         print(f"- {text_key}: {coverage:.3f}, {jaccard:.3f}, {gini:.3f}, {simpson:.3f}")
-        # if pkl_sample_diversity_masks:
-        #     print("PKL contact diversity across samples per text (coverage, jaccard, gini, simpson)")
-        #     for text_key, masks in pkl_sample_diversity_masks.items():
-        #         if not masks:
-        #             print(f"- {text_key}: 0.000, 0.000, 0.000, 0.000")
-        #             continue
-        #         union_mask = np.logical_or.reduce(masks)
-        #         coverage = _coverage_ratio(union_mask)
-        #         jaccard = _jaccard_diversity_samples(masks)
-        #         freq_counts = np.sum(np.stack(masks, axis=0), axis=0).astype(np.float32)
-        #         gini = _gini_index(freq_counts)
-        #         simpson = _simpson_diversity(freq_counts)
-        #         print(f"- {text_key}: {coverage:.3f}, {jaccard:.3f}, {gini:.3f}, {simpson:.3f}")
+        return {
+            "file_name": file_name,
+            "per_text_rows": per_text_rows,
+            "overall": overall,
+            "num_texts": len(per_text_rows),
+        }
 
 
 def main():
-    rr.init("Input Data", spawn=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--visualize", action="store_true", help="enable rerun visualization"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=os.path.join(home, "Desktop/hot3d_vis"),
+        help="directory containing pkl files",
+    )
+    parser.add_argument(
+        "--input-files",
+        nargs="+",
+        default=[
+        # "grab_exc_rot_aug.pkl",
+        # "grab_exc_rot_aug_gaze_emb_afford_mix_init_5_trans.pkl",
+        # "grab_exc_rot_aug_afford.pkl",
+        # "grab_exc_rot_aug_afford_mix.pkl",
+        # "grab_exc_rot_aug_gaze_emb_toekn.pkl",
+        "grab_exc_rot_aug_gaze_emb_token_vec.pkl",
+        "grab_exc_rot_aug_gaze_emb_token_vec_ro.pkl",
+        # "grab_exc_rot_aug_gaze_emb_token_vec_ro_afford_mix.pkl",
+                 ],
+        help="one or more pickle files to compare",
+    )
+    args = parser.parse_args()
 
-    file_name = f"grab_mug_ro"
-    recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    visualize_rr(recoding_name, file_name)
-    
-    # file_name = f"grab_mug"
-    # recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    # visualize_rr(recoding_name, file_name)
-    
-    # file_name = f"grab_mug_two"
-    # recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    # visualize_rr(recoding_name, file_name)
+    if args.visualize:
+        # Default to spawning the viewer so --visualize shows output immediately.
+        # Set HOT3D_RERUN_SPAWN=0 to disable auto-spawn.
+        spawn_viewer = os.environ.get("HOT3D_RERUN_SPAWN", "1") == "1"
+        rr.init("Input Data", spawn=spawn_viewer)
+        if not spawn_viewer:
+            print(
+                "[INFO] Rerun viewer auto-spawn disabled (set HOT3D_RERUN_SPAWN=1 to enable)."
+            )
+
+    all_results = []
+    for file_name in args.input_files:
+        recoding_name = (
+            file_name
+            if os.path.isabs(file_name)
+            else os.path.join(args.input_dir, file_name)
+        )
+        if not os.path.exists(recoding_name):
+            print(f"[WARN] missing file: {recoding_name}")
+            continue
+        all_results.append(
+            visualize_rr(recoding_name, file_name, visualize=args.visualize)
+        )
+
+    if not all_results:
+        print("[WARN] no valid input files were processed.")
+        return
+
+    _print_cross_file_summary(all_results)
+    out_csv = os.path.join(os.path.expanduser("~"), "contact_metrics.csv")
+    _write_metrics_csv(out_csv, all_results)
+    print(f"\nSaved metrics CSV: {out_csv}")
+    _print_target_text_metric_rankings(all_results, _TARGET_TEXTS)
 
 
 if __name__ == "__main__":

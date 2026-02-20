@@ -16,7 +16,9 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return edict(config)
 
-config = load_config("mano.yaml")
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
+config = load_config(os.path.join(_REPO_ROOT, "mano.yaml"))
 mano_config = config.mano
 MODEL_DIR =  os.path.join(os.path.expanduser("~"), "Desktop/hot3d_vis/mano_v1_2/models")
 SKELETONS = mano_config.skeletons

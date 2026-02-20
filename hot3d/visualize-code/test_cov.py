@@ -7,6 +7,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 import itertools
 import json
+import ast
 import inspect
 import re
 from typing import Optional
@@ -53,6 +54,18 @@ import rerun as rr
 import pickle
 
 
+def rotate_pc_y(points, degrees):
+    radians = np.deg2rad(degrees)
+    cos_t = np.cos(radians)
+    sin_t = np.sin(radians)
+    rot = torch.tensor(
+        [[cos_t, 0.0, sin_t], [0.0, 1.0, 0.0], [-sin_t, 0.0, cos_t]],
+        dtype=points.dtype,
+        device=points.device,
+    )
+    return points @ rot.T
+
+
 def gaussian_smooth(vertices, sigma=1):
     return gaussian_filter1d(vertices, sigma=sigma, axis=0)
 
@@ -63,33 +76,6 @@ def log_image(image: np.array, label: str, static=False) -> None:
 
 def log_pose(pose: SE3, label: str, static=False) -> None:
     rr.log(label, ToTransform3D(pose, False), static=static)
-
-
-def _log_text(label: str, text: str, static: bool = False) -> None:
-    if hasattr(rr, "TextLog"):
-        rr.log(label, rr.TextLog(text), static=static)
-    elif hasattr(rr, "TextDocument"):
-        rr.log(label, rr.TextDocument(text), static=static)
-    elif hasattr(rr, "AnyValues"):
-        rr.log(label, rr.AnyValues(text=text), static=static)
-    else:
-        print(f"{label}: {text}")
-
-
-def _get_batch_value(value, batch_idx: int):
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple, np.ndarray, torch.Tensor)):
-        if len(value) > batch_idx:
-            return value[batch_idx]
-        return value
-    return value
-
-
-def _sanitize_path_token(value) -> str:
-    token = str(value).strip()
-    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", token)
-    return token or "unknown"
 
 
 def _sanitize_entity_path(text: str) -> str:
@@ -203,110 +189,260 @@ def _build_grouping_keys(text: str) -> tuple[str, str]:
     action_key = f"{object_key}::{text}"
     return object_key, action_key
 
+
 def _reduce_cov_counts(cov_frame: np.ndarray, num_points: int) -> Optional[np.ndarray]:
     cov_counts = None
-    if cov_frame.ndim == 2:
-        if cov_frame.shape[0] == num_points:
-            cov_counts = cov_frame.sum(axis=1)
-        elif cov_frame.shape[1] == num_points:
-            cov_counts = cov_frame.sum(axis=0)
+    if cov_frame.ndim >= 2:
+        if cov_frame.shape[-1] == num_points:
+            axes = tuple(range(cov_frame.ndim - 1))
+            cov_counts = cov_frame.sum(axis=axes)
+        elif cov_frame.shape[0] == num_points:
+            axes = tuple(range(1, cov_frame.ndim))
+            cov_counts = cov_frame.sum(axis=axes)
     elif cov_frame.ndim == 1 and cov_frame.shape[0] == num_points:
         cov_counts = cov_frame
     return cov_counts
 
 
 def _compute_point_colors(cov_values: np.ndarray) -> np.ndarray:
-    max_count = float(np.max(cov_values)) if np.max(cov_values) > 0 else 1.0
-    intensity = np.clip(cov_values / max_count, 0.0, 1.0).astype(np.float32)
+    cov_values = np.asarray(cov_values, dtype=np.float32)
+    if cov_values.size == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    vmin = float(np.min(cov_values))
+    vmax = float(np.max(cov_values))
+    if vmax <= vmin:
+        intensity = np.zeros_like(cov_values, dtype=np.float32)
+    else:
+        # Normalize to [0, 1] and use gamma to enhance contrast.
+        intensity = (cov_values - vmin) / (vmax - vmin)
+        intensity = np.clip(intensity, 0.0, 1.0) ** 0.6
     low_color = np.array([0, 0, 255], dtype=np.float32)
     high_color = np.array([255, 255, 0], dtype=np.float32)
     return (low_color + (high_color - low_color) * intensity[:, None]).astype(np.uint8)
 
 
+def _render_histogram_image(
+    counts: np.ndarray, height: int = 160, bar_width: int = 4
+) -> np.ndarray:
+    if counts.size == 0:
+        return np.full((height, 1, 3), 255, dtype=np.uint8)
+    max_count = int(np.max(counts))
+    if max_count <= 0:
+        return np.full((height, 1, 3), 255, dtype=np.uint8)
+    width = counts.shape[0] * bar_width
+    img = np.full((height, width, 3), 255, dtype=np.uint8)
+    max_value = float(np.max(counts))
+    for idx, value in enumerate(counts):
+        if value <= 0:
+            continue
+        bar_height = int((value / max_value) * (height - 1))
+        x0 = idx * bar_width
+        x1 = x0 + bar_width
+        y0 = height - bar_height
+        img[y0:height, x0:x1, :] = 0
+    return img
+
+
 # The saved pickle references "__main__.Hot3DActionDataset". Make sure this
 # name exists so pickle can resolve the dataset class.
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize contact coverage.")
     parser.add_argument(
         "--mode",
         choices=("avg", "individual", "both"),
-        default="individual",
+        default="avg",
         help="avg: aggregated average per action, individual: per item, both: show both.",
+    )
+    parser.add_argument(
+        "--hist-overlap",
+        action="store_true",
+        help="log histogram of contact index overlap across samples.",
     )
     return parser.parse_args()
 
 
-def _log_point_cloud(base_path: str, points: np.ndarray, cov_values: np.ndarray) -> None:
+def _log_point_cloud(
+    base_path: str, points: np.ndarray, cov_values: np.ndarray, offset: np.ndarray
+) -> None:
     colors = _compute_point_colors(cov_values)
+    points = np.asarray(points)
+    if points.ndim == 2 and points.shape[1] != 3 and points.shape[0] == 3:
+        points = points.T
+    elif points.ndim != 2 or points.shape[1] != 3:
+        points = points.reshape(-1, 3)
+    points = points + np.asarray(offset)
+    if points.size:
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
+        extent = float((maxs - mins).max())
+        point_radius = max(0.003, 0.02 * extent)
+    else:
+        point_radius = 0.02
     rr.log(
         f"{base_path}/point_cloud",
         rr.Points3D(
             positions=points,
-            radii=0.005,
+            radii=point_radius,
             colors=colors,
         ),
         static=True,
     )
 
 
-def main() -> None:
-    args = _parse_args()
+def _log_title(base_path: str, title: str, offset: np.ndarray) -> None:
+    rr.log(
+        f"{base_path}/title",
+        rr.Points3D(
+            positions=[offset + np.array([0.0, 0.25, 0.0], dtype=np.float32)],
+            radii=0.01,
+            colors=[255, 255, 255],
+            labels=[title],
+        ),
+        static=True,
+    )
 
-    rr.init("Input Data", spawn=True)
+
+rr.init("Input Data", spawn=True)
+
+
+def main(file_name: str, offset_x: float = 0.0) -> None:
+    args = _parse_args()
+    offset = np.array([offset_x, 0.0, 0.0], dtype=np.float32)
 
     home = os.path.expanduser("~")
-    with open(os.path.join(home, "Desktop/hot3d_vis/contact_results_e12000.pkl"), "rb") as f:
+    with open(os.path.join(home, file_name), "rb") as f:
         item_list = pickle.load(f)
 
+    file_tag = os.path.basename(file_name)
+    _log_title(file_tag, file_tag, offset)
+
     aggregates = {}
+    aggregate_counts = {}
+    aggregate_points = {}
+    overlap_counts = {}
+    global_overlap_counts = None
 
-    for idx, (_, cov, text) in enumerate(item_list):
-        object_key, action_key = _build_grouping_keys(str(text))
-        if object_key not in obj_pc:
-            continue
-        obj_points = obj_pc[object_key].detach().cpu().numpy()
-        num_points = obj_points.shape[0]
+    sample_counter = 0
+    for idx, (rotated_pc, cov, text) in enumerate(item_list):
 
-        if cov is None:
-            continue
-        cov_arr = np.asarray(cov)
-        cov_mean = cov_arr.mean(axis=0) if cov_arr.ndim >= 2 else cov_arr
-        cov_counts = _reduce_cov_counts(np.asarray(cov_mean), num_points)
-        if cov_counts is None:
-            continue
+        def _maybe_parse_list_string(value):
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    try:
+                        parsed = ast.literal_eval(stripped)
+                        if isinstance(parsed, (list, tuple)):
+                            return parsed
+                    except (ValueError, SyntaxError):
+                        pass
+            return value
 
-        if args.mode in ("individual", "both"):
-            base_path = _sanitize_entity_path(object_key)
-            text_path = _sanitize_entity_path(str(text))
-            item_path = f"{base_path}/{text_path}/items/{idx:04d}"
-            _log_point_cloud(item_path, obj_points, cov_counts)
+        def _flatten_texts(value):
+            value = _maybe_parse_list_string(value)
+            if isinstance(value, (list, tuple)):
+                out = []
+                for v in value:
+                    out.extend(_flatten_texts(v))
+                return out
+            return [value]
 
-        if args.mode in ("avg", "both"):
-            entry = aggregates.get(action_key)
-            if entry is None:
-                aggregates[action_key] = {
-                    "object_key": object_key,
-                    "text": str(text),
-                    "sum": cov_counts.astype(np.float32),
-                    "count": 1,
-                }
+        raw_texts = _flatten_texts(text)
+        text_keys = [str(t) for t in raw_texts]
+
+        cov_arr = None
+        per_text_cov = None
+        if cov is not None:
+            cov_arr = np.asarray(cov)
+            per_text_cov = (
+                cov_arr
+                if cov_arr.ndim >= 2 and cov_arr.shape[0] == len(text_keys)
+                else None
+            )
+
+        for text_idx, text_key in enumerate(text_keys):
+            obj_points_source = rotated_pc
+            if isinstance(obj_points_source, torch.Tensor):
+                obj_points_source = obj_points_source.detach().cpu().numpy()
             else:
-                entry["sum"] += cov_counts
-                entry["count"] += 1
+                obj_points_source = np.asarray(obj_points_source)
+            if obj_points_source.ndim == 3 and obj_points_source.shape[0] == len(
+                text_keys
+            ):
+                # rotated_pc is per-text point cloud: (num_text, num_points, 3)
+                obj_points_source = obj_points_source[text_idx]
+            elif obj_points_source.ndim >= 4 and obj_points_source.shape[0] == len(
+                text_keys
+            ):
+                obj_points_source = obj_points_source[text_idx]
+            if obj_points_source.ndim == 2:
+                obj_points_source = obj_points_source[None, ...]
+            if obj_points_source.ndim != 3:
+                continue
+            num_points = obj_points_source.shape[1]
+
+            if args.mode in ("individual", "both"):
+                base_path = f"{file_tag}/{_sanitize_entity_path(text_key)}"
+                for sample_idx, obj_points in enumerate(obj_points_source):
+                    if obj_points.ndim != 2 or obj_points.shape[1] != 3:
+                        continue
+                    cov_values = np.zeros(num_points, dtype=np.int64)
+                    if cov_arr is not None:
+                        cov_arr_text = (
+                            np.asarray(per_text_cov[text_idx])
+                            if per_text_cov is not None
+                            else cov_arr
+                        )
+                        cov_counts = _reduce_cov_counts(cov_arr_text, num_points)
+                        if cov_counts is not None:
+                            cov_values = cov_counts
+                    item_path = f"{base_path}/items/{sample_counter:06d}"
+                    _log_point_cloud(
+                        item_path,
+                        obj_points,
+                        cov_values,
+                        offset,
+                    )
+                    sample_counter += 1
+            if args.mode in ("avg", "both"):
+                cov_values = np.zeros(num_points, dtype=np.int64)
+                if cov_arr is not None:
+                    cov_arr_text = (
+                        np.asarray(per_text_cov[text_idx])
+                        if per_text_cov is not None
+                        else cov_arr
+                    )
+                    cov_counts = _reduce_cov_counts(cov_arr_text, num_points)
+                    if cov_counts is not None:
+                        cov_values = cov_counts
+                aggregate_counts[text_key] = aggregate_counts.get(text_key, 0) + 1
+                if text_key not in aggregates:
+                    aggregates[text_key] = cov_values.astype(np.float64)
+                else:
+                    aggregates[text_key] += cov_values
+                if text_key not in aggregate_points:
+                    aggregate_points[text_key] = obj_points_source[0]
 
     if args.mode in ("avg", "both"):
-        for action_key, entry in aggregates.items():
-            object_key = entry["object_key"]
-            text_entry = entry["text"]
-            base_path = _sanitize_entity_path(object_key)
-            text_path = _sanitize_entity_path(text_entry)
-            base_path = f"{base_path}/{text_path}"
+        for text_key, cov_sum in aggregates.items():
+            count = max(aggregate_counts.get(text_key, 1), 1)
+            cov_avg = cov_sum / float(count)
+            base_path = f"{file_tag}/{_sanitize_entity_path(text_key)}/avg"
+            points = aggregate_points.get(text_key)
+            if points is None:
+                continue
+            _log_point_cloud(
+                base_path,
+                points,
+                cov_avg,
+                offset,
+            )
 
-            points = obj_pc[object_key].detach().cpu().numpy()
-            cov_avg = entry["sum"] / max(entry["count"], 1)
-            _log_point_cloud(base_path, points, cov_avg)
+        # _log_point_cloud("ori_pc", ori_pc[0], np.zeros(1024, dtype=np.int64), offset)
 
 
 if __name__ == "__main__":
-    main()
+    main("Desktop/hot3d_vis/contact_grab_exc_3_obj_rot_aug_afford.pkl", offset_x=0.24)
+    # main("Desktop/hot3d_vis/contact_grab_exc_rot_aug.pkl", offset_x=0.0)
+    # main("Desktop/hot3d_vis/contact_grab_exc_two_obj_rot.pkl", offset_x=-3.0)

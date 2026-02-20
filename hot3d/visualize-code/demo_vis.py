@@ -255,41 +255,52 @@ for obj_name in object_model.obj_pcs.keys():
 l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
 r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
         
-def visualize_rr(recoding_name, file_name, color):
+def visualize_rr(recoding_name, file_name, color, align: bool = True):
+
+    with open(f"{home}/Desktop/hot3d_vis/qq2.pkl", "rb") as f:
+        item2 = pickle.load(f)
+
     with open(recoding_name, "rb") as f:
         item = pickle.load(f)
 
-        for item_idx, (lhand_verts, lhand_faces, rhand_verts, rhand_faces, obj_verts, est_contact_map) in enumerate(item):
-            base_path = "item"
+        for item_idx, (hand_verts, hand_faces, obj_verts, est_contact_map, text) in enumerate(item):
+            align_tag = "aligned" if align else "raw"
+            base_path = f"{align_tag}/item"
             sample_path = f"{base_path}/sample_{item_idx:03d}"
 
-            hand_verts_np = _to_numpy(lhand_verts)
-            hand_faces_np = _to_numpy(lhand_faces)
+            hand_verts_np = _to_numpy(hand_verts)
+            hand_faces_np = _to_numpy(hand_faces)
             if hand_faces_np is None:
                 hand_faces_np = r_hand_layer.faces.copy()
             hand_faces_np = np.asarray(hand_faces_np, dtype=np.int32)
 
-            rhand_verts_np = _to_numpy(rhand_verts)
-            rhand_faces_np = _to_numpy(rhand_faces)
-            if rhand_faces_np is None:
-                rhand_faces_np = r_hand_layer.faces.copy()
-            rhand_faces_np = np.asarray(rhand_faces_np, dtype=np.int32)
+            # rhand_verts_np = _to_numpy(rhand_verts)
+            # rhand_faces_np = _to_numpy(rhand_faces)
+            # if rhand_faces_np is None:
+            #     rhand_faces_np = r_hand_layer.faces.copy()
+            # rhand_faces_np = np.asarray(rhand_faces_np, dtype=np.int32)
 
             obj_verts_np = _to_numpy(obj_verts)
             contact_np = _to_numpy(est_contact_map)
 
-
+            ref_obj = obj_verts_np[0] if obj_verts_np is not None and obj_verts_np.shape[0] > 0 else None
             num_frames = max(hand_verts_np.shape[0], obj_verts_np.shape[0])
             for frame_idx in range(num_frames):
-                rr.set_time_sequence("sample", item_idx)
-                rr.set_time_sequence("frame", frame_idx)
+                rr.set_time("frame", sequence=frame_idx)
 
                 hand_frame = hand_verts_np[min(frame_idx, hand_verts_np.shape[0] - 1)]
-                rhand_frame = rhand_verts_np[min(frame_idx, rhand_verts_np.shape[0] - 1)]   
+                # rhand_frame = rhand_verts_np[min(frame_idx, rhand_verts_np.shape[0] - 1)]   
                 obj_frame = obj_verts_np[min(frame_idx, obj_verts_np.shape[0] - 1)]
                 contact_frame = None
                 if contact_np is not None:
                     contact_frame = contact_np[min(frame_idx, contact_np.shape[0] - 1)]
+
+                if align and ref_obj is not None and obj_frame is not None and obj_frame.shape == ref_obj.shape:
+                    R, t = rigid_transform(obj_frame, ref_obj)
+                    hand_frame = apply_rigid_transform(hand_frame, R, t)
+                    obj_frame = ref_obj
+                    if contact_frame is not None and contact_frame.shape[0] != obj_frame.shape[0]:
+                        contact_frame = None
 
                 rr.log(
                     f"{sample_path}/hand",
@@ -303,19 +314,8 @@ def visualize_rr(recoding_name, file_name, color):
                         ).vertex_normals,
                     ),
                 )
-                rr.log(
-                    f"{sample_path}/rhand",
-                    rr.Mesh3D(
-                        vertex_positions=rhand_frame,
-                        triangle_indices=rhand_faces_np,
-                        vertex_normals=trimesh.Trimesh(
-                            vertices=rhand_frame,
-                            faces=rhand_faces_np,
-                            process=False,
-                        ).vertex_normals,
-                    ),
-                )
 
+                # obj_frame = item2[0][-1].squeeze()
                 colors = np.zeros((obj_frame.shape[0], 3), dtype=np.uint8)
                 colors[:] = [0, 0, 255]
                 if contact_frame is not None and contact_frame.shape[0] == obj_frame.shape[0]:
@@ -338,7 +338,8 @@ def main():
     
     file_name = "qq"
     recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    visualize_rr(recoding_name, file_name, random_rgb_color())
+    # visualize_rr(recoding_name, file_name, random_rgb_color(), align=True)
+    visualize_rr(recoding_name, file_name, random_rgb_color(), align=False)
     
 
 if __name__ == "__main__":

@@ -32,10 +32,8 @@ def gaussian_smooth(vertices, sigma=1):
 def log_image(image: np.array, label: str, static=False) -> None:
     rr.log(label, rr.Image(image), static=static)
 
-
 def log_pose(pose: SE3, label: str, static=False) -> None:
     rr.log(label, ToTransform3D(pose, False), static=static)
-
 
 class ObjectModel:
     def __init__(self, pkl_file):

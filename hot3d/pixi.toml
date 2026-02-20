@@ -25,7 +25,7 @@ viewer = "python3 viewer.py"
 [dependencies]
 pip = "*"
 python = "==3.10"
-rerun-sdk = "~=0.16.1"
+rerun-sdk = "~=0.29.1"
 
 [pypi-dependencies]
 torch = "~=2.1.2"

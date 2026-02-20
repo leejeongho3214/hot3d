@@ -1,13 +1,33 @@
+from rot import *
+from data_loaders.mano_layer import MANOHandModel
+from mano import build_mano_aa
+import numpy as np
+import pickle
+import rerun as rr
+import torch
+from collections import defaultdict
+from scipy.ndimage import gaussian_filter1d
+from sklearn.manifold import TSNE
+import trimesh
+from projectaria_tools.utils.rerun_helpers import ToTransform3D
+from projectaria_tools.core.sophus import SE3
 import argparse
 import json
 import inspect
 import re
+import hashlib
 from typing import Optional
+import sys
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HOT3D_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if HOT3D_ROOT not in sys.path:
+    sys.path.insert(0, HOT3D_ROOT)
+
 
 if not hasattr(inspect, "getargspec"):
     # Compatibility for chumpy on Python 3.11+
     inspect.getargspec = inspect.getfullargspec  # type: ignore[attr-defined]
-import numpy as np
 
 # NumPy 1.24+ compatibility for legacy packages (e.g., chumpy)
 for _name, _type in [
@@ -20,13 +40,6 @@ for _name, _type in [
     # Use __dict__ to avoid triggering NumPy deprecation warnings during attribute access
     if _name not in np.__dict__:
         setattr(np, _name, _type)
-
-from projectaria_tools.core.sophus import SE3
-from projectaria_tools.utils.rerun_helpers import ToTransform3D
-import trimesh
-
-from scipy.ndimage import gaussian_filter1d
-from collections import defaultdict
 
 
 def gaussian_smooth(vertices, sigma=1):
@@ -41,32 +54,17 @@ def log_pose(pose: SE3, label: str, static=False) -> None:
     rr.log(label, ToTransform3D(pose, False), static=static)
 
 
-import os
-import torch
-import numpy as np
-
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
-from rot import *
-
-import rerun as rr
-import pickle
-
-
-from data_loaders.mano_layer import MANOHandModel
-import os
-
-from mano import build_mano_aa
-
-
 _rng = np.random.default_rng()
 
 
 def random_rgb_color() -> list[int]:
     """Return a random RGB color as a list of ints in [0, 255]."""
     return _rng.integers(0, 256, size=3, dtype=np.uint8).tolist()
+
+
+def _color_for_text(text: str) -> list[int]:
+    digest = hashlib.md5(text.encode("utf-8")).digest()
+    return [int(digest[0]), int(digest[1]), int(digest[2])]
 
 
 class ObjectModel:
@@ -131,29 +129,6 @@ def process_obj_result(obj_verts, obj_params):
     return obj_verts_transformed
 
 
-def rigid_transform(A, B):
-    """두 포인트 클라우드 A, B (N,3) numpy array에 대해, B로 정렬하는 R, t 반환"""
-    centroid_A = A.mean(axis=0)
-    centroid_B = B.mean(axis=0)
-    AA = A - centroid_A
-    BB = B - centroid_B
-
-    H = AA.T @ BB
-    U, S, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[2, :] *= -1
-        R = Vt.T @ U.T
-
-    t = centroid_B - R @ centroid_A
-    return R, t
-
-
-def apply_rigid_transform(points, R, t):
-    """Apply a rigid transform to (N,3) points."""
-    return (points @ R.T) + t
-
-
 _PART_KEYWORDS = [
     "handle",
     "rim",
@@ -177,6 +152,7 @@ _PART_KEYWORDS = [
 
 
 def _extract_part_keyword(text: str) -> Optional[str]:
+    text = _coerce_text(text).lower()
     for keyword in _PART_KEYWORDS:
         if re.search(rf"\b{re.escape(keyword)}\b", text):
             return keyword
@@ -185,41 +161,28 @@ def _extract_part_keyword(text: str) -> Optional[str]:
 
 def _sanitize_entity_path(text: str) -> str:
     """Make a rerun-friendly path segment while keeping the text semantics."""
+    text = _coerce_text(text)
     sanitized = re.sub(r"\s+", "_", text.strip())
     sanitized = re.sub(r"[^A-Za-z0-9_.\\-]", "_", sanitized)
     sanitized = sanitized.strip("._")
     return sanitized or "entry"
 
 
-def _normalize_action_key(text: str) -> str:
-    """Return a grouping key that ignores hand laterality and keeps object part names."""
-    lowered = re.sub(r"\s+", " ", text.lower()).strip(" .")
-    if not lowered:
+def _coerce_text(text) -> str:
+    if isinstance(text, (list, tuple)):
+        if len(text) == 0:
+            return ""
+        return _coerce_text(text[0])
+    if text is None:
         return ""
-    base, sep, _ = lowered.partition(" with ")
-    if not base:
-        base = lowered
-    base = re.sub(r"\b(right|left|hands?|hand)\b", "", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    if not base:
-        base = lowered
-    if " of " in base:
-        before_of, obj = base.split(" of ", 1)
-        part_keyword = _extract_part_keyword(before_of)
-        if not part_keyword:
-            part_keyword = _extract_part_keyword(lowered)
-        if part_keyword and part_keyword not in before_of:
-            verb = before_of.split()[0] if before_of.split() else before_of
-            base = f"{verb} {part_keyword} of {obj}"
-    if base:
-        return base
-    cleaned = re.sub(r"\b(right|left|hands?|hand)\b", "", lowered)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned if cleaned else lowered
+    if not isinstance(text, str):
+        return str(text)
+    return text
 
 
 def _extract_of_with_target(text: str) -> Optional[str]:
     """Return the target between 'of' and 'with' for grouping."""
+    text = _coerce_text(text)
     match = re.search(r"\bof\s+(.+?)\s+with\b", text, flags=re.IGNORECASE)
     if not match:
         return None
@@ -227,11 +190,24 @@ def _extract_of_with_target(text: str) -> Optional[str]:
     return target.lower() if target else None
 
 
+def _base_text_before_with(text: str) -> str:
+    return _coerce_text(text).strip()
+
+
 def _build_grouping_keys(text: str) -> tuple[str, str]:
-    """Group by object first, then by full text within the object."""
+    """Group by object first, then by full text (include hand details)."""
+    text = _coerce_text(text)
     object_key = _extract_of_with_target(text) or text
-    action_key = f"{object_key}::{text}"
+    full_text = _base_text_before_with(text)
+    action_key = f"{object_key}::{full_text}"
     return object_key, action_key
+
+
+def _get_batch_text(text, batch_idx: int) -> str:
+    if isinstance(text, (list, tuple)):
+        if len(text) > batch_idx:
+            return _coerce_text(text[batch_idx])
+    return _coerce_text(text)
 
 
 with open(os.path.join(home, "Desktop/hot3d_vis/instance.json"), "r") as f:
@@ -248,277 +224,307 @@ l_hand_layer = build_mano_aa(is_rhand=False, flat_hand=False)
 r_hand_layer = build_mano_aa(is_rhand=True, flat_hand=False)
 
 
-def visualize_rr(recoding_name, idx):
+def _to_tensor(data):
+    if torch.is_tensor(data):
+        return data
+    if isinstance(data, (list, tuple)) and len(data) > 0 and torch.is_tensor(data[0]):
+        return torch.stack(list(data), dim=0)
+    return torch.as_tensor(data)
+
+
+def _set_frame_time(frame_idx: int) -> None:
+    # Rerun API differs by version: some expose set_time_sequence, others set_time.
+    if hasattr(rr, "set_time_sequence"):
+        rr.set_time_sequence("frame", frame_idx)
+    else:
+        rr.set_time("frame", sequence=frame_idx)
+
+
+def _apply_offset(points, offset_xyz):
+    if torch.is_tensor(points):
+        offset = torch.tensor(
+            offset_xyz, dtype=points.dtype, device=points.device)
+        return points + offset
+    return np.asarray(points) + np.asarray(offset_xyz, dtype=np.float32)
+
+
+def _vertex_colors_like(points, rgb_color):
+    if torch.is_tensor(points):
+        n = int(points.shape[0])
+    else:
+        n = int(np.asarray(points).shape[0])
+    colors = np.tile(np.asarray(rgb_color, dtype=np.uint8), (n, 1))
+    return colors
+
+
+def _log_offset_anchor(label: str, offset_xyz, color, anchor_id: str) -> None:
+    anchor_pos = np.asarray(
+        [[offset_xyz[0], offset_xyz[1] + 0.25, offset_xyz[2]]], dtype=np.float32
+    )
+    rr.log(
+        f"anchors/{anchor_id}",
+        rr.Points3D(
+            positions=anchor_pos,
+            radii=[0.006],
+            colors=[list(color)],
+            labels=[label],
+        ),
+        static=True,
+    )
+
+
+def visualize_rr(
+    recoding_name,
+    idx,
+    offset_xyz=(0.0, 0.0, 0.0),
+    run_color=(121, 121, 121),
+    log_gt=False,
+):
     with open(recoding_name, "rb") as f:
         item = pickle.load(f)
 
         action_to_sample_counts = defaultdict(int)
-        ref_obj_pred = {}
-        ref_obj_gt = {}
+        ref_obj = {}
+        method = "course"
+        tsne_vectors = []
+        tsne_labels = []
+        tsne_colors = []
+        tsne_names = []
+        text_colors = {}
 
         for (
-            x_lhand,
-            x_rhand,
+            fine_lhand,
+            fine_rhand,
             x_obj,
             text,
             course_lhand,
             course_rhand,
-            gt_obj,
-            gaze_map,
-            cov_map,
+            _,
+            cond_enc,
             est_cov_map,
+            _,
+            gt_x_obj,
         ) in item:
-            for batch_idx in range(32):
-                text_entry = text
-                object_key, action_key = _build_grouping_keys(text_entry)
+            for batch_idx in range(len(course_lhand)):
+                text_entry_full = _get_batch_text(text, batch_idx)
+                text_entry_base = text_entry_full
+                object_key, action_key = _build_grouping_keys(text_entry_full)
                 base_path = _sanitize_entity_path(object_key)
-                text_path = _sanitize_entity_path(text_entry)
-                hand_path = "r_hand" if "right" in text_entry.lower() else "l_hand"
+                text_path = _sanitize_entity_path(text_entry_base)
+                hand_path = (
+                    "hands"
+                    if "both" in text_entry_full.lower()
+                    else "r_hand" if "right" in text_entry_full.lower() else "l_hand"
+                )
+
                 sample_idx = action_to_sample_counts[action_key]
                 action_to_sample_counts[action_key] += 1
-                sample_pred_path = f"{idx}/original/fine/{base_path}/{text_path}/sample_{sample_idx:03d}"
-                sample_gt_path = f"{idx}/original/course/{base_path}/{text_path}/sample_{sample_idx:03d}"
 
-                # if text_entry.split("of ")[-1].split(" with")[0].lower() not in ["mug_white", "flask", "mug_patterned"]:
+                cond_tensor = _to_tensor(cond_enc)
+                cond_vec = (
+                    cond_tensor[batch_idx] if cond_tensor.ndim > 1 else cond_tensor
+                )
+                cond_vec = cond_vec.detach().cpu().numpy().reshape(-1)
+                tsne_vectors.append(cond_vec)
+                part_label = _extract_part_keyword(text_entry_base)
+                part_label = (
+                    part_label if part_label in {
+                        "body", "rim", "handle"} else "x"
+                )
+                tsne_labels.append(part_label)
+                tsne_names.append(part_label)
+                if text_entry_base not in text_colors:
+                    text_colors[text_entry_base] = _color_for_text(
+                        text_entry_base)
+                tsne_colors.append(text_colors[text_entry_base])
 
-                if text_entry.split("of ")[-1].split(" with")[0].lower() not in [
-                    "mug_white"
-                ]:
+                text_root_path = f"original/{base_path}/{text_path}"
+                sample_path = f"{text_root_path}/sample_{sample_idx:03d}"
+                gt_prompt_path = f"{text_root_path}/_gt_obj/sample_{sample_idx:03d}"
+
+                # if text_entry_full.split("of ")[-1].split(" with")[0].lower() not in [
+                #     "mug_white"
+                # ]:
+                #     continue
+
+                # obj_vertices = process_obj_result(
+                #     obj_pc[text_entry_full.split("of ")[-1].split(" with")[0].lower()],
+                #     x_obj[batch_idx],
+                # )
+
+                if object_key not in obj_pc:
+                    print(
+                        f"[WARN] unresolved object key: '{object_key}' from text '{text_entry_full}'"
+                    )
                     continue
+                x_obj_vertices = process_obj_result(
+                    obj_pc[object_key], x_obj[batch_idx])
+                gt_x_obj_vertices = None
+                if (
+                    log_gt
+                    and gt_x_obj is not None
+                    and torch.is_tensor(gt_x_obj)
+                    and gt_x_obj.ndim == 3
+                    and gt_x_obj.shape[0] > batch_idx
+                ):
+                    gt_x_obj_vertices = process_obj_result(
+                        obj_pc[object_key], gt_x_obj[batch_idx]
+                    )
 
-                # r_hand_vertices, r_hand_faces = process_hand_result(
-                #     r_hand_layer, x_rhand[batch_idx]
-                # )
-                # l_hand_vertices, l_hand_faces = process_hand_result(
-                #     l_hand_layer, x_lhand[batch_idx]
-                # )
-
-                obj_vertices = process_obj_result(
-                    obj_pc[text_entry.split("of ")[-1].split(" with")[0].lower()],
-                    x_obj[batch_idx],
+                r_hand_vertices, r_hand_faces = (
+                    process_hand_result(
+                        r_hand_layer, _to_tensor(course_rhand[batch_idx])
+                    )
+                    if method == "course"
+                    else process_hand_result(
+                        r_hand_layer, _to_tensor(fine_rhand[batch_idx])
+                    )
+                )
+                l_hand_vertices, l_hand_faces = (
+                    process_hand_result(
+                        l_hand_layer, _to_tensor(course_lhand[batch_idx])
+                    )
+                    if method == "course"
+                    else process_hand_result(
+                        l_hand_layer, _to_tensor(fine_lhand[batch_idx])
+                    )
                 )
 
-                r_hand_vertices_gt, r_hand_faces = process_hand_result(
-                    r_hand_layer, course_rhand[batch_idx]
-                )
-                l_hand_vertices_gt, l_hand_faces = process_hand_result(
-                    l_hand_layer, course_lhand[batch_idx]
-                )
-                # obj_vertices_gt = process_obj_result(
-                #     obj_pc[text.split("of ")[-1].split(" with")[0].lower()],
-                #     gt_obj[batch_idx],
-                # )
-                obj_vertices_gt = obj_vertices
-
-                if action_key not in ref_obj_gt:
-                    ref_obj_gt[action_key] = obj_vertices_gt[0].detach().cpu().numpy()
-
-                if action_key not in ref_obj_pred:
-                    ref_obj_pred[action_key] = obj_vertices[0].detach().cpu().numpy()
+                if action_key not in ref_obj:
+                    ref_obj[action_key] = x_obj_vertices[0].detach().cpu().numpy()
 
                 r_mesh = trimesh.Trimesh(
-                    vertices=r_hand_vertices_gt[0], faces=r_hand_faces, process=False
+                    vertices=r_hand_vertices[0], faces=r_hand_faces, process=False
                 )
                 l_mesh = trimesh.Trimesh(
-                    vertices=l_hand_vertices_gt[0], faces=l_hand_faces, process=False
+                    vertices=l_hand_vertices[0], faces=l_hand_faces, process=False
                 )
 
-                for frame_idx in range(obj_vertices.shape[0]):
-                    rr.set_time_sequence("sample", sample_idx)
-                    rr.set_time_sequence("frame", frame_idx)
+                for frame_idx in range(r_hand_vertices.shape[0]):
+                    _set_frame_time(frame_idx)
+                    r_pos = _apply_offset(
+                        r_hand_vertices[frame_idx], offset_xyz)
+                    l_pos = _apply_offset(
+                        l_hand_vertices[frame_idx], offset_xyz)
+                    x_obj_pos = _apply_offset(
+                        x_obj_vertices[frame_idx], offset_xyz)
+                    gt_x_obj_pos = None
+                    if gt_x_obj_vertices is not None:
+                        gt_x_obj_pos = _apply_offset(
+                            gt_x_obj_vertices[frame_idx], offset_xyz
+                        )
 
-                    # if "right" in text_entry.lower():
-                    #     rr.log(
-                    #         f"{sample_pred_path}/{hand_path}",
-                    #         rr.Mesh3D(
-                    #             vertex_positions=r_hand_vertices[frame_idx],
-                    #             triangle_indices=r_hand_faces,
-                    #             vertex_normals=r_mesh.vertex_normals,
-                    #         ),
-                    #     )
-
-                    # else:
-                    #     rr.log(
-                    #         f"{sample_pred_path}/{hand_path}",
-                    #         rr.Mesh3D(
-                    #             vertex_positions=l_hand_vertices[frame_idx],
-                    #             triangle_indices=l_hand_faces,
-                    #             vertex_normals=l_mesh.vertex_normals,
-                    #         ),
-                    #     )
-
-                    if "right" in text_entry.lower():
+                    if "right" in text_entry_full.lower():
                         rr.log(
-                            f"{sample_gt_path}/{hand_path}",
+                            f"{sample_path}/{hand_path}/{idx}",
                             rr.Mesh3D(
-                                vertex_positions=r_hand_vertices_gt[frame_idx],
+                                vertex_positions=r_pos,
                                 triangle_indices=r_hand_faces,
                                 vertex_normals=r_mesh.vertex_normals,
+                                vertex_colors=_vertex_colors_like(
+                                    r_pos, run_color),
                             ),
                         )
 
-                    else:
+                    elif "left" in text_entry_full.lower():
                         rr.log(
-                            f"{sample_gt_path}/{hand_path}",
+                            f"{sample_path}/{hand_path}/{idx}",
                             rr.Mesh3D(
-                                vertex_positions=l_hand_vertices_gt[frame_idx],
+                                vertex_positions=l_pos,
                                 triangle_indices=l_hand_faces,
                                 vertex_normals=l_mesh.vertex_normals,
+                                vertex_colors=_vertex_colors_like(
+                                    l_pos, run_color),
+                            ),
+                        )
+                    else:
+                        rr.log(
+                            f"{sample_path}/{hand_path}_r/{idx}",
+                            rr.Mesh3D(
+                                vertex_positions=r_pos,
+                                triangle_indices=r_hand_faces,
+                                vertex_normals=r_mesh.vertex_normals,
+                                vertex_colors=_vertex_colors_like(
+                                    r_pos, run_color),
+                            ),
+                        )
+                        rr.log(
+                            f"{sample_path}/{hand_path}_l/{idx}",
+                            rr.Mesh3D(
+                                vertex_positions=l_pos,
+                                triangle_indices=l_hand_faces,
+                                vertex_normals=l_mesh.vertex_normals,
+                                vertex_colors=_vertex_colors_like(
+                                    l_pos, run_color),
                             ),
                         )
 
-                    # rr.log(
-                    #     f"{sample_gt_path}/object",
-                    #     rr.Points3D(
-                    #         positions=obj_vertices[frame_idx],
-                    #         radii=0.005,
-                    #         colors=[121, 121, 121],
-                    #         labels=[text_entry],
-                    #     ),
-                    # )
-
-                    obj_pred_np = obj_vertices[frame_idx].detach().cpu().numpy()
-                    obj_gt_np = obj_vertices_gt[frame_idx].detach().cpu().numpy()
-                    # r_hand_np = r_hand_vertices[frame_idx].detach().cpu().numpy()
-                    # l_hand_np = l_hand_vertices[frame_idx].detach().cpu().numpy()
-                    r_hand_gt_np = r_hand_vertices_gt[frame_idx].detach().cpu().numpy()
-                    l_hand_gt_np = l_hand_vertices_gt[frame_idx].detach().cpu().numpy()
-
-                    R_pred, t_pred = rigid_transform(
-                        obj_pred_np, ref_obj_pred[action_key]
-                    )
-                    R_gt, t_gt = rigid_transform(obj_gt_np, ref_obj_gt[action_key])
-
-                    # r_hand_aligned = apply_rigid_transform(r_hand_np, R_pred, t_pred)
-                    # l_hand_aligned = apply_rigid_transform(l_hand_np, R_pred, t_pred)
-                    r_hand_gt_aligned = apply_rigid_transform(r_hand_gt_np, R_gt, t_gt)
-                    l_hand_gt_aligned = apply_rigid_transform(l_hand_gt_np, R_gt, t_gt)
-
-                    aligned_pred_path = f"{idx}/aligned/pred/{base_path}/{text_path}/sample_{sample_idx:03d}"
-                    aligned_gt_path = f"{idx}/aligned/course/{base_path}/{text_path}/sample_{sample_idx:03d}"
-
-                    # rr.log(
-                    #     f"{aligned_pred_path}/object",
-                    #     rr.Points3D(
-                    #         positions=ref_obj_pred[action_key],
-                    #         radii=0.005,
-                    #         colors=[160, 160, 160],
-                    #         labels=[text_entry],
-                    #     ),
-                    # )
                     rr.log(
-                        f"{aligned_gt_path}/object",
+                        f"{sample_path}/object_x_obj/{idx}",
                         rr.Points3D(
-                            positions=ref_obj_gt[action_key],
+                            positions=x_obj_pos,
                             radii=0.005,
-                            colors=[160, 160, 160],
-                            labels=[text_entry],
+                            colors=list(run_color),
                         ),
                     )
-
-                    if "right" in text_entry.lower():
-                        # rr.log(
-                        #     f"{aligned_pred_path}/{hand_path}",
-                        #     rr.Mesh3D(
-                        #         vertex_positions=r_hand_aligned,
-                        #         triangle_indices=r_hand_faces,
-                        #         vertex_normals=r_mesh.vertex_normals,
-                        #     ),
-                        # )
+                    if gt_x_obj_pos is not None:
                         rr.log(
-                            f"{aligned_gt_path}/{hand_path}",
-                            rr.Mesh3D(
-                                vertex_positions=r_hand_gt_aligned,
-                                triangle_indices=r_hand_faces,
-                                vertex_normals=r_mesh.vertex_normals,
+                            f"{gt_prompt_path}/{idx}",
+                            rr.Points3D(
+                                positions=gt_x_obj_pos,
+                                radii=0.005,
+                                colors=[255, 255, 255],
                             ),
                         )
-                    else:
-                        # rr.log(
-                        #     f"{aligned_pred_path}/{hand_path}",
-                        #     rr.Mesh3D(
-                        #         vertex_positions=l_hand_aligned,
-                        #         triangle_indices=l_hand_faces,
-                        #         vertex_normals=l_mesh.vertex_normals,
-                        #     ),
-                        # )
-                        rr.log(
-                            f"{aligned_gt_path}/{hand_path}",
-                            rr.Mesh3D(
-                                vertex_positions=l_hand_gt_aligned,
-                                triangle_indices=l_hand_faces,
-                                vertex_normals=l_mesh.vertex_normals,
-                            ),
-                        )
-
-                    # if gaze_map[batch_idx][frame_idx].sum() != 0 or frame_idx == 0:
-                    #     colors = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
-                    #     colors[gaze_map[batch_idx][frame_idx] == 1] = [255, 255, 0]
-                    #     colors[gaze_map[batch_idx][frame_idx] == 0] = [0, 0, 255]
-
-                    # rr.log(
-                    #     f"{sample_gt_path}/gaze_map",
-                    #     rr.Points3D(
-                    #         positions=obj_vertices_gt[frame_idx],
-                    #         radii=0.005,
-                    #         colors=colors,
-                    #         labels=[text[batch_idx]],
-                    #     ),
-                    # )
 
                     # colors_cov = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
-                    # colors_cov[cov_map[batch_idx] == 1] = [255, 255, 0]
-                    # colors_cov[cov_map[batch_idx] == 0] = [0, 0, 255]
+                    # colors_cov[est_cov_map[batch_idx] == 1] = [255, 255, 0]
+                    # colors_cov[est_cov_map[batch_idx] == 0] = [0, 0, 255]
 
                     # rr.log(
-                    #     f"{sample_gt_path}/cov_map",
-                    #     rr.Points3D(
-                    #         positions=obj_vertices_gt[frame_idx],
-                    #         radii=0.005,
-                    #         colors=colors_cov,
-                    #     )
-                    #     )
-
-                    colors_cov = np.zeros_like(obj_pc[obj_name], dtype=np.uint8)
-                    # colors_cov[:] = [0, 0, 255]
-                    colors_cov[est_cov_map[batch_idx] == 1] = [255, 255, 0]
-                    colors_cov[est_cov_map[batch_idx] == 0] = [0, 0, 255]
-
-                    # rr.log(
-                    #     f"{sample_pred_path}/est_cov_map",
+                    #     f"{sample_path}/est_cov_map",
                     #     rr.Points3D(
                     #         positions=obj_vertices[frame_idx],
                     #         radii=0.005,
                     #         colors=colors_cov,
                     #     ),
                     # )
-
-
-                    rr.log(
-                        f"{sample_gt_path}/est_cov_map",
-                        rr.Points3D(
-                            positions=obj_vertices[frame_idx],
-                            radii=0.005,
-                            colors=colors_cov,
-                        ),
-                    )
+        # _log_cond_tsne(tsne_vectors, tsne_labels, tsne_colors, tsne_names)
 
 
 def main():
     rr.init("Input Data", spawn=True)
 
-    # file_name = f"grab_ori"
-    # recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    # visualize_rr(recoding_name, file_name)
-    
-    file_name = f"grab_mug"
-    recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    visualize_rr(recoding_name, file_name)
-    
-    file_name = f"grab_mug_two"
-    recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}.pkl"
-    visualize_rr(recoding_name, file_name)
-
+    # Horizontal spacing between runs so different files are shown side-by-side.
+    offset_step = 1.0
+    run_colors = [
+        (235, 87, 87),   # red
+        (47, 128, 237),  # blue
+        (39, 174, 96),   # green
+    ]
+    input_files = [
+        "grab_exc_rot_aug.pkl",
+        "grab_exc_rot_aug_gaze_emb_token_vec.pkl",
+        "grab_exc_rot_aug_gaze_emb_token_vec_ro.pkl",
+        # "grab_exc_rot_aug_gaze_emb_token_vec_ro_afford_mix.pkl",
+    ]
+    for run_idx, file_name in enumerate(input_files):
+        offset_xyz = (run_idx * offset_step, 0.0, 0.0)
+        run_color = run_colors[run_idx % len(run_colors)]
+        _log_offset_anchor(
+            file_name,
+            offset_xyz,
+            run_color,
+            f"run_{run_idx}",
+        )
+        recoding_name = f"{home}/Desktop/hot3d_vis/{file_name}"
+        visualize_rr(
+            recoding_name,
+            file_name,
+            offset_xyz=offset_xyz,
+            run_color=run_color,
+            log_gt=True,
+        )
 
 
 if __name__ == "__main__":
