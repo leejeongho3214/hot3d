@@ -5,3 +5,11 @@
 *DS_Store
 
 *.pyc
+*.md
+*.csv
+*.png
+*.ppt
+*.pptx
+*.doc
+
+*.rrd
